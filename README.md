@@ -11,19 +11,20 @@ Le script utilise une architecture en deux phases contenues dans le **même fich
 ```
 Nœud login                          Nœud de calcul
 ──────────────────────────────────  ──────────────────────────────────
-bash run_aster.sh mon_etude/        sbatch re-soumet CE MÊME script
+bash run_aster.sh mon_etude/        sbatch soumet CE MÊME script
   │                                   avec __ASTER_PHASE=RUN
   ├─ Détecte .comm / .med / .mail
   ├─ Crée le dossier scratch
   ├─ Copie les fichiers
-  ├─ Génère le .export                ├─ Charge Code_Aster (Lmod)
-  └─ sbatch → ───────────────────►   ├─ Lance le calcul (séquentiel ou MPI)
+  ├─ Génère le .export                ├─ Charge Code_Aster
+  └─ sbatch → ───────────────────►    ├─ Lance le calcul (séquentiel ou MPI)
                                       ├─ Diagnostic du .mess
                                       ├─ Rapatrie scratch → work
                                       └─ Résumé final
 ```
 
 **Phase 1** (nœud login) : préparation et soumission.
+
 **Phase 2** (nœud de calcul) : exécution, détectée par la variable `__ASTER_PHASE=RUN` transmise via `sbatch --export`.
 
 ---
@@ -80,7 +81,7 @@ Si plusieurs fichiers `.comm` ou `.med` sont trouvés dans le dossier, le premie
 |--------|--------|-------------|
 | `-p, --partition NOM` | `court`    | Partition Slurm |
 | `-n, --nodes N`       | `1`        | Nombre de nœuds |
-| `-t, --ntasks N`      | `4`        | Tâches MPI |
+| `-t, --ntasks N`      | `1`        | Tâches MPI |
 | `-c, --cpus N`        | `1`        | CPUs par tâche |
 | `-m, --mem MEM`       | `5G`       | Mémoire par nœud |
 | `-T, --time DUREE`    | `05:00:00` | Durée maximale |
@@ -97,7 +98,7 @@ Raccourcis pour les configurations typiques :
 | `moyen`    | moyen     | 8 G     | 3 jours   |
 | `long`     | long      | 32 G    | 30 jours  |
 
-Les options passées **après** `-P` surchargent le préréglage :
+Les options passées **après** `-P` remplacent les paramètres par défaut :
 
 ```bash
 bash run_aster.sh -P moyen -t 8   # préréglage moyen, mais 8 tâches MPI
@@ -110,6 +111,23 @@ Déclare des fichiers de sortie additionnels (au-delà de `.mess`, `.resu`, `_re
 ```
 -R "type:unite,type:unite,..."
 ```
+
+#### Rappel ####
+
+| Unité | Type fichier | Extension | Direction | Description |
+|:-----:|:------------|:---------:|:---------:|:------------|
+| 1 | comm | `.comm` | D (entrée) | Fichier de commandes |
+| 6 | mess | `.mess` | R (sortie) | Messages d'exécution (log) |
+| 8 | resu | `.resu` | R (sortie) | Résultats texte (IMPR_RESU format RESULTAT) |
+| 19 | mgib | `.mgib` | D (entrée) | Maillage format GIBI/Castem **(WIP)** |
+| 20 | mmed | `.med` | D (entrée) | Maillage format MED (Salome) |
+| 20 | mail | `.mail` | D (entrée) | Maillage format ASTER natif |
+| 37 | pos | `.pos` | R (sortie) | Post-traitement Gmsh (IMPR_RESU format GMSH) |
+| 38 | csv | `.csv` | R (sortie) | Tableau CSV (IMPR_TABLE format TABLEAU) |
+| 39 | table | `.table` | R (sortie) | Table ASTER (IMPR_TABLE) |
+| 40 | dat | `.dat` | R (sortie) | Données brutes / fichiers annexes |
+| 80 | rmed | `.med` | R (sortie) | Résultats format MED (IMPR_RESU format MED) |
+| 81+ | rmed | `.med` | R (sortie) | Résultats MED supplémentaires |
 
 Types disponibles : `rmed`, `resu`, `mess`, `csv`, `table`, `dat`, `pos`
 
@@ -210,9 +228,10 @@ $STUDY_DIR/                               ← work (rapatrié)
 ## Suivre un calcul en cours
 
 ```bash
-squeue -j <JOB_ID>                     # état du job
+squeue -j <JOB_ID>       # état du job
 tail -f ~/calculs/mon_etude/aster_<JOB_ID>.out   # logs temps réel
-scancel <JOB_ID>                       # annuler (rapatriement automatique)
+scancel <JOB_ID>        # annuler (rapatriement automatique)
+sview                   # intarface graphique de l'état du job
 ```
 
 ---

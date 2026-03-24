@@ -1,7 +1,7 @@
 # Ignorer tout sauf le script principal et la documentation
 *
-#.gitignore
+.gitignore
 !run_aster.sh
 !README.md
 !*.md
-!tests/
+!test/

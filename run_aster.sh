@@ -112,16 +112,16 @@ OPTIONS
   -h, --help           Afficher cette aide
 
 EXEMPLES
-  sbatch run_aster_slurm.sh                              # Étude dans le dossier courant
-  sbatch run_aster_slurm.sh ~/calculs/poutre/            # Spécifier le dossier
-  sbatch run_aster_slurm.sh -P court                     # Préréglage court  (2 h)
-  sbatch run_aster_slurm.sh -P moyen                     # Préréglage moyen  (24 h)
-  sbatch run_aster_slurm.sh -P long                      # Préréglage long   (72 h)
-  sbatch run_aster_slurm.sh -P moyen -t 8                # Moyen mais 8 tâches MPI
-  sbatch run_aster_slurm.sh -n 2 -t 8 -m 8G             # Personnalisé
-  sbatch run_aster_slurm.sh -p debug -T 01:00:00         # Partition debug, 1h max
-  sbatch run_aster_slurm.sh -C mon_calcul.comm -M maillage.med
-  sbatch run_aster_slurm.sh -P moyen --results "rmed:81,csv:38"
+  bash run_aster_slurm.sh                              # Étude dans le dossier courant
+  bash run_aster_slurm.sh ~/calculs/poutre/            # Spécifier le dossier
+  bash run_aster_slurm.sh -P court                     # Préréglage court  (2 h)
+  bash run_aster_slurm.sh -P moyen                     # Préréglage moyen  (24 h)
+  bash run_aster_slurm.sh -P long                      # Préréglage long   (72 h)
+  bash run_aster_slurm.sh -P moyen -t 8                # Moyen mais 8 tâches MPI
+  bash run_aster_slurm.sh -n 2 -t 8 -m 8G             # Personnalisé
+  bash run_aster_slurm.sh -p debug -T 01:00:00         # Partition debug, 1h max
+  bash run_aster_slurm.sh -C mon_calcul.comm -M maillage.med
+  bash run_aster_slurm.sh -P moyen --results "rmed:81,csv:38"
 EOF
     exit 0
 }
