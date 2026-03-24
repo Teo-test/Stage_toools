@@ -31,7 +31,7 @@ ASTER_MODULE="${ASTER_MODULE:-code_aster}"
 SCRATCH_BASE="${SCRATCH_BASE:-/scratch}"
 
 # ── Valeurs par défaut Slurm ──────────────────────────────────────────────────
-DEFAULT_PARTITION="compute"
+DEFAULT_PARTITION="court"
 DEFAULT_NODES=1
 DEFAULT_NTASKS=4
 DEFAULT_CPUS_PER_TASK=1
@@ -40,9 +40,9 @@ DEFAULT_TIME="24:00:00"
 
 # ── Préréglages de ressources (-P court | -P moyen | -P long) ─────────────────
 #    Modifiez ces lignes pour les adapter aux partitions de votre cluster.
-PRESET_COURT_PARTITION="compute" ; PRESET_COURT_NTASKS=2 ; PRESET_COURT_MEM="2G"  ; PRESET_COURT_TIME="02:00:00"
-PRESET_MOYEN_PARTITION="compute" ; PRESET_MOYEN_NTASKS=4 ; PRESET_MOYEN_MEM="8G"  ; PRESET_MOYEN_TIME="24:00:00"
-PRESET_LONG_PARTITION="compute"  ; PRESET_LONG_NTASKS=8  ; PRESET_LONG_MEM="32G"  ; PRESET_LONG_TIME="72:00:00"
+PRESET_COURT_PARTITION="court"  ; PRESET_COURT_NTASKS=2 ; PRESET_COURT_MEM="2G"  ; PRESET_COURT_TIME="02:00:00"
+PRESET_MOYEN_PARTITION="court"  ; PRESET_MOYEN_NTASKS=4 ; PRESET_MOYEN_MEM="8G"  ; PRESET_MOYEN_TIME="24:00:00"
+PRESET_LONG_PARTITION="court"   ; PRESET_LONG_NTASKS=8  ; PRESET_LONG_MEM="32G"  ; PRESET_LONG_TIME="72:00:00"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  AFFICHAGE
@@ -329,11 +329,6 @@ JOB_SCRIPT="${SCRATCH_DIR}/job.sh"
 
 cat > "$JOB_SCRIPT" <<SBATCH_SCRIPT
 #!/bin/bash
-# Job Code_Aster — généré par run_aster_slurm le $(date)
-# Étude   : ${STUDY_NAME}
-# Scratch : ${SCRATCH_DIR}
-
-# ── Directives Slurm ──────────────────────────────────────────────────────────
 #SBATCH --job-name=aster_${STUDY_NAME}
 #SBATCH --partition=${PARTITION}
 #SBATCH --nodes=${NODES}
@@ -344,10 +339,38 @@ cat > "$JOB_SCRIPT" <<SBATCH_SCRIPT
 #SBATCH --output=${LOG_DIR}/aster_%j.out
 #SBATCH --error=${LOG_DIR}/aster_%j.err
 
+# Job Code_Aster — généré par run_aster_slurm le $(date)
+# Étude   : ${STUDY_NAME}
+# Scratch : ${SCRATCH_DIR}
+
 # ── Fonctions affichage ───────────────────────────────────────────────────────
 ts()  { date '+%H:%M:%S'; }
 log() { echo "[\$(ts)] \$*"; }
 sep() { echo ""; echo "══════════════════════════════════════════════════════"; echo "  \$*"; echo "══════════════════════════════════════════════════════"; }
+
+# ── Trap : rapatrier les résultats même en cas de scancel / timeout ───────────
+rapatrier() {
+    sep "RAPATRIEMENT DES RÉSULTATS (trap)"
+    local dest="${STUDY_DIR}"
+    local n=0
+    for f in \\
+        "${SCRATCH_DIR}/${STUDY_NAME}.mess" \\
+        "${SCRATCH_DIR}/${STUDY_NAME}.resu" \\
+        "${SCRATCH_DIR}/${STUDY_NAME}_resu.med"
+    do
+        if [ -f "\$f" ] && [ -s "\$f" ]; then
+            cp "\$f" "\$dest/"
+            log "Rapatrié : \$(basename "\$f")  →  \$dest/"
+            (( n++ )) || true
+        fi
+    done
+    # Copier aussi les logs SLURM s'ils existent déjà
+    for f in "${LOG_DIR}"/aster_\${SLURM_JOB_ID:-unknown}.{out,err}; do
+        [ -f "\$f" ] && cp "\$f" "\$dest/" 2>/dev/null
+    done
+    [ "\$n" -eq 0 ] && log "⚠  Aucun fichier résultat trouvé dans ${SCRATCH_DIR}"
+}
+trap rapatrier EXIT
 
 sep "DÉBUT CALCUL CODE_ASTER — \$(date)"
 log "Job ID         : \$SLURM_JOB_ID"
@@ -398,24 +421,26 @@ else
 fi
 ASTER_RC=\$?
 
-# ── Rapatriement des résultats → dossier d'étude ─────────────────────────────
-sep "RAPATRIEMENT DES RÉSULTATS"
-STUDY_DIR_DEST="${STUDY_DIR}"
-copied=0
-for f in \
-    "${SCRATCH_DIR}/${STUDY_NAME}.mess" \
-    "${SCRATCH_DIR}/${STUDY_NAME}.resu" \
-    "${SCRATCH_DIR}/${STUDY_NAME}_resu.med"
-do
-    if [ -f "\$f" ] && [ -s "\$f" ]; then
-        cp "\$f" "\$STUDY_DIR_DEST/"
-        log "Rapatrié : \$(basename "\$f")  →  \$STUDY_DIR_DEST/"
-        (( copied++ )) || true
+# ── Diagnostic rapide du fichier .mess ────────────────────────────────────────
+sep "DIAGNOSTIC"
+MESS_PATH="${SCRATCH_DIR}/${STUDY_NAME}.mess"
+if [ -f "\$MESS_PATH" ]; then
+    NB_ALARM=\$(grep -c "<A>" "\$MESS_PATH" 2>/dev/null || echo 0)
+    NB_FATAL=\$(grep -c "<F>" "\$MESS_PATH" 2>/dev/null || echo 0)
+    NB_EXCEP=\$(grep -c "<S>" "\$MESS_PATH" 2>/dev/null || echo 0)
+    log "Alarmes <A>       : \$NB_ALARM"
+    log "Erreurs fatales <F>: \$NB_FATAL"
+    log "Exceptions <S>    : \$NB_EXCEP"
+    if [ "\$NB_FATAL" -gt 0 ]; then
+        log "--- Première erreur fatale ---"
+        grep -B2 -A5 "<F>" "\$MESS_PATH" | head -20
+        log "--- fin ---"
     fi
-done
-[ "\$copied" -eq 0 ] && log "⚠  Aucun fichier résultat trouvé dans ${SCRATCH_DIR}"
+else
+    log "⚠  Fichier .mess non trouvé (échec au démarrage ?)"
+fi
 
-# ── Résumé ────────────────────────────────────────────────────────────────────
+# ── Résumé (le rapatriement est fait automatiquement par le trap EXIT) ────────
 sep "RÉSUMÉ FINAL"
 if [ "\$ASTER_RC" -eq 0 ]; then
     log "Statut    : SUCCÈS ✓"
@@ -423,7 +448,7 @@ else
     log "Statut    : ÉCHEC  ✗  (code \$ASTER_RC)"
 fi
 log "Étude     : ${STUDY_NAME}"
-log "Résultats : \$STUDY_DIR_DEST"
+log "Résultats : ${STUDY_DIR}"
 log "Scratch   : ${SCRATCH_DIR}"
 log "Log       : ${LOG_DIR}/aster_\${SLURM_JOB_ID}.out"
 log "Fin       : \$(date)"
