@@ -38,6 +38,12 @@ DEFAULT_CPUS_PER_TASK=1
 DEFAULT_MEM="4G"
 DEFAULT_TIME="24:00:00"
 
+# ── Préréglages de ressources (-P court | -P moyen | -P long) ─────────────────
+#    Modifiez ces lignes pour les adapter aux partitions de votre cluster.
+PRESET_COURT_PARTITION="compute" ; PRESET_COURT_NTASKS=2 ; PRESET_COURT_MEM="2G"  ; PRESET_COURT_TIME="02:00:00"
+PRESET_MOYEN_PARTITION="compute" ; PRESET_MOYEN_NTASKS=4 ; PRESET_MOYEN_MEM="8G"  ; PRESET_MOYEN_TIME="24:00:00"
+PRESET_LONG_PARTITION="compute"  ; PRESET_LONG_NTASKS=8  ; PRESET_LONG_MEM="32G"  ; PRESET_LONG_TIME="72:00:00"
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  AFFICHAGE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -75,6 +81,13 @@ ${BOLD}RESSOURCES SLURM${NC}
   -m, --mem       MEM  Mémoire/nœud     [défaut: ${DEFAULT_MEM}]
   -T, --time  H:M:S   Durée max        [défaut: ${DEFAULT_TIME}]
 
+${BOLD}PRÉRÉGLAGES${NC}
+  -P, --preset NOM     Préréglage de ressources (court, moyen, long)
+                         court : ${PRESET_COURT_NTASKS} tâches, ${PRESET_COURT_MEM}, ${PRESET_COURT_TIME}
+                         moyen : ${PRESET_MOYEN_NTASKS} tâches, ${PRESET_MOYEN_MEM}, ${PRESET_MOYEN_TIME}
+                         long  : ${PRESET_LONG_NTASKS} tâches, ${PRESET_LONG_MEM}, ${PRESET_LONG_TIME}
+                       Les options -n -t -m -T passées après -P surchargent le préréglage.
+
 ${BOLD}OPTIONS${NC}
   -q, --quiet          Sortie minimale (juste le job ID)
   -h, --help           Afficher cette aide
@@ -82,7 +95,11 @@ ${BOLD}OPTIONS${NC}
 ${BOLD}EXEMPLES${NC}
   run_aster_slurm                              # Étude dans le dossier courant
   run_aster_slurm ~/calculs/poutre/            # Spécifier le dossier
-  run_aster_slurm -n 2 -t 8 -m 8G             # 2 nœuds, 8 tâches MPI
+  run_aster_slurm -P court                     # Préréglage court  (2 h)
+  run_aster_slurm -P moyen                     # Préréglage moyen  (24 h)
+  run_aster_slurm -P long                      # Préréglage long   (72 h)
+  run_aster_slurm -P moyen -t 8                # Moyen mais 8 tâches MPI
+  run_aster_slurm -n 2 -t 8 -m 8G             # Personnalisé
   run_aster_slurm -p debug -T 01:00:00         # Partition debug, 1h max
   run_aster_slurm -C mon_calcul.comm -M maillage.med
   run_aster_slurm -C mon_calcul.comm -A maillage.mail
@@ -101,12 +118,13 @@ STUDY_DIR="."
 COMM_FILE=""
 MED_FILE=""
 MAIL_FILE=""
-PARTITION="$DEFAULT_PARTITION"
-NODES="$DEFAULT_NODES"
-NTASKS="$DEFAULT_NTASKS"
-CPUS="$DEFAULT_CPUS_PER_TASK"
-MEM="$DEFAULT_MEM"
-TIME_LIMIT="$DEFAULT_TIME"
+PRESET=""
+PARTITION=""
+NODES=""
+NTASKS=""
+CPUS=""
+MEM=""
+TIME_LIMIT=""
 QUIET=false
 
 while [[ $# -gt 0 ]]; do
@@ -114,6 +132,7 @@ while [[ $# -gt 0 ]]; do
         -C|--comm)       COMM_FILE="$2";    shift 2 ;;
         -M|--med)        MED_FILE="$2";     shift 2 ;;
         -A|--mail)       MAIL_FILE="$2";    shift 2 ;;
+        -P|--preset)     PRESET="$2";       shift 2 ;;
         -p|--partition)  PARTITION="$2";    shift 2 ;;
         -n|--nodes)      NODES="$2";        shift 2 ;;
         -t|--ntasks)     NTASKS="$2";       shift 2 ;;
@@ -126,6 +145,41 @@ while [[ $# -gt 0 ]]; do
         *)               STUDY_DIR="$1";    shift ;;
     esac
 done
+
+# ── Application du préréglage (les options explicites ont priorité) ────────────
+if [ -n "$PRESET" ]; then
+    case "${PRESET,,}" in
+        court|short)
+            : "${PARTITION:=$PRESET_COURT_PARTITION}"
+            : "${NTASKS:=$PRESET_COURT_NTASKS}"
+            : "${MEM:=$PRESET_COURT_MEM}"
+            : "${TIME_LIMIT:=$PRESET_COURT_TIME}"
+            $QUIET || info "Préréglage : court  (${PRESET_COURT_NTASKS} tâches, ${PRESET_COURT_MEM}, ${PRESET_COURT_TIME})"
+            ;;
+        moyen|medium)
+            : "${PARTITION:=$PRESET_MOYEN_PARTITION}"
+            : "${NTASKS:=$PRESET_MOYEN_NTASKS}"
+            : "${MEM:=$PRESET_MOYEN_MEM}"
+            : "${TIME_LIMIT:=$PRESET_MOYEN_TIME}"
+            $QUIET || info "Préréglage : moyen  (${PRESET_MOYEN_NTASKS} tâches, ${PRESET_MOYEN_MEM}, ${PRESET_MOYEN_TIME})"
+            ;;
+        long)
+            : "${PARTITION:=$PRESET_LONG_PARTITION}"
+            : "${NTASKS:=$PRESET_LONG_NTASKS}"
+            : "${MEM:=$PRESET_LONG_MEM}"
+            : "${TIME_LIMIT:=$PRESET_LONG_TIME}"
+            $QUIET || info "Préréglage : long   (${PRESET_LONG_NTASKS} tâches, ${PRESET_LONG_MEM}, ${PRESET_LONG_TIME})"
+            ;;
+        *) err "Préréglage inconnu : '$PRESET'  (valeurs acceptées : court, moyen, long)"; exit 1 ;;
+    esac
+fi
+# Valeurs par défaut pour tout paramètre non fixé par option ou préréglage
+: "${PARTITION:=$DEFAULT_PARTITION}"
+: "${NODES:=$DEFAULT_NODES}"
+: "${NTASKS:=$DEFAULT_NTASKS}"
+: "${CPUS:=$DEFAULT_CPUS_PER_TASK}"
+: "${MEM:=$DEFAULT_MEM}"
+: "${TIME_LIMIT:=$DEFAULT_TIME}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DÉTECTION DES FICHIERS
