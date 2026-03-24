@@ -1,20 +1,25 @@
 #!/bin/bash
-# =============================================================================
-#  run_aster_slurm — Soumission de calculs Code_Aster via Slurm
-# =============================================================================
+#===============================================================================
+#  run_aster_slurm — Calcul Code_Aster via sbatch (fichier unique)
+#===============================================================================
 #
-#  Usage : run_aster_slurm [OPTIONS] [DOSSIER_ETUDE]
+#  Usage :  sbatch run_aster_slurm.sh [OPTIONS] [DOSSIER_ETUDE]
 #
-#  Détecte automatiquement le .comm et le maillage dans DOSSIER_ETUDE
-#  (défaut : répertoire courant), copie tout dans /scratch/$USER/ sur le
-#  nœud login (système de fichiers partagé), génère le .export, soumet
-#  le job Slurm, puis rapatrie les résultats dans DOSSIER_ETUDE.
+#  Le script fonctionne en DEUX PHASES dans un seul fichier :
+#
+#    PHASE 1 (nœud login) : sbatch lance ce script sans directives #SBATCH.
+#      Il détecte qu'on est en phase de préparation (__ASTER_PHASE non défini),
+#      prépare le scratch, copie les fichiers, génère le .export, puis se
+#      RE-SOUMET LUI-MÊME avec les bons paramètres via sbatch --partition=...
+#
+#    PHASE 2 (nœud de calcul) : le script détecte __ASTER_PHASE=RUN
+#      (transmis via --export), charge Code_Aster et lance le calcul.
+#      À la fin (ou en cas de scancel/timeout), un trap rapatrie
+#      les résultats vers le dossier d'étude d'origine.
 #
 #  Auteur   : généré pour localcluster
-#  Version  : 2.0
-# =============================================================================
-
-set -euo pipefail
+#  Version  : 3.0
+#===============================================================================
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION — modifier ici selon l'installation
@@ -27,10 +32,9 @@ ASTER_ROOT="${ASTER_ROOT:-/opt/code_aster}"
 ASTER_MODULE="${ASTER_MODULE:-code_aster}"
 
 # Répertoire scratch partagé (accessible depuis login ET nœuds de calcul)
-# Surchargeable : SCRATCH_BASE=/mon/chemin ./run_aster_slurm ...
 SCRATCH_BASE="${SCRATCH_BASE:-/scratch}"
 
-# ── Valeurs par défaut Slurm ──────────────────────────────────────────────────
+# ── Valeurs par défaut Slurm ─────────────────────────────────────────────────
 DEFAULT_PARTITION="court"
 DEFAULT_NODES=1
 DEFAULT_NTASKS=4
@@ -38,14 +42,13 @@ DEFAULT_CPUS_PER_TASK=1
 DEFAULT_MEM="4G"
 DEFAULT_TIME="24:00:00"
 
-# ── Préréglages de ressources (-P court | -P moyen | -P long) ─────────────────
-#    Modifiez ces lignes pour les adapter aux partitions de votre cluster.
+# ── Préréglages de ressources (-P court | -P moyen | -P long) ────────────────
 PRESET_COURT_PARTITION="court"  ; PRESET_COURT_NTASKS=2 ; PRESET_COURT_MEM="2G"  ; PRESET_COURT_TIME="02:00:00"
 PRESET_MOYEN_PARTITION="court"  ; PRESET_MOYEN_NTASKS=4 ; PRESET_MOYEN_MEM="8G"  ; PRESET_MOYEN_TIME="24:00:00"
 PRESET_LONG_PARTITION="court"   ; PRESET_LONG_NTASKS=8  ; PRESET_LONG_MEM="32G"  ; PRESET_LONG_TIME="72:00:00"
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AFFICHAGE
+#  AFFICHAGE (utilisé dans les deux phases)
 # ══════════════════════════════════════════════════════════════════════════════
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -55,6 +58,9 @@ ok()      { echo -e "${GREEN}[ OK ]${NC}  $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 err()     { echo -e "${RED}[ ERR]${NC}  $*" >&2; }
 section() { echo -e "\n${BOLD}${CYAN}▶ $*${NC}"; echo -e "${CYAN}$(printf '─%.0s' {1..60})${NC}"; }
+ts()      { date '+%H:%M:%S'; }
+log()     { echo "[$(ts)] $*"; }
+sep()     { echo ""; echo "══════════════════════════════════════════════════════"; echo "  $*"; echo "══════════════════════════════════════════════════════"; }
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  AIDE
@@ -62,7 +68,7 @@ section() { echo -e "\n${BOLD}${CYAN}▶ $*${NC}"; echo -e "${CYAN}$(printf '─
 usage() {
     cat <<EOF
 ${BOLD}USAGE${NC}
-  run_aster_slurm [OPTIONS] [DOSSIER_ETUDE]
+  sbatch run_aster_slurm.sh [OPTIONS] [DOSSIER_ETUDE]
 
   Lance un calcul Code_Aster via Slurm.
   Les fichiers sont copiés dans ${SCRATCH_BASE}/\$USER/ avant soumission.
@@ -79,37 +85,167 @@ ${BOLD}RESSOURCES SLURM${NC}
   -t, --ntasks    N    Tâches MPI       [défaut: ${DEFAULT_NTASKS}]
   -c, --cpus      N    CPUs par tâche   [défaut: ${DEFAULT_CPUS_PER_TASK}]
   -m, --mem       MEM  Mémoire/nœud     [défaut: ${DEFAULT_MEM}]
-  -T, --time  H:M:S   Durée max        [défaut: ${DEFAULT_TIME}]
+  -T, --time  H:M:S    Durée max        [défaut: ${DEFAULT_TIME}]
 
 ${BOLD}PRÉRÉGLAGES${NC}
   -P, --preset NOM     Préréglage de ressources (court, moyen, long)
                          court : ${PRESET_COURT_NTASKS} tâches, ${PRESET_COURT_MEM}, ${PRESET_COURT_TIME}
                          moyen : ${PRESET_MOYEN_NTASKS} tâches, ${PRESET_MOYEN_MEM}, ${PRESET_MOYEN_TIME}
                          long  : ${PRESET_LONG_NTASKS} tâches, ${PRESET_LONG_MEM}, ${PRESET_LONG_TIME}
-                       Les options -n -t -m -T passées après -P surchargent le préréglage.
+                       Les options passées après -P surchargent le préréglage.
 
 ${BOLD}OPTIONS${NC}
   -q, --quiet          Sortie minimale (juste le job ID)
   -h, --help           Afficher cette aide
 
 ${BOLD}EXEMPLES${NC}
-  run_aster_slurm                              # Étude dans le dossier courant
-  run_aster_slurm ~/calculs/poutre/            # Spécifier le dossier
-  run_aster_slurm -P court                     # Préréglage court  (2 h)
-  run_aster_slurm -P moyen                     # Préréglage moyen  (24 h)
-  run_aster_slurm -P long                      # Préréglage long   (72 h)
-  run_aster_slurm -P moyen -t 8                # Moyen mais 8 tâches MPI
-  run_aster_slurm -n 2 -t 8 -m 8G             # Personnalisé
-  run_aster_slurm -p debug -T 01:00:00         # Partition debug, 1h max
-  run_aster_slurm -C mon_calcul.comm -M maillage.med
-  run_aster_slurm -C mon_calcul.comm -A maillage.mail
-
-${BOLD}VARIABLES D'ENVIRONNEMENT${NC}
-  ASTER_ROOT    Chemin vers Code_Aster (défaut: /opt/code_aster)
-  ASTER_MODULE  Nom du module Lmod      (défaut: code_aster)
+  sbatch run_aster_slurm.sh                              # Étude dans le dossier courant
+  sbatch run_aster_slurm.sh ~/calculs/poutre/            # Spécifier le dossier
+  sbatch run_aster_slurm.sh -P court                     # Préréglage court  (2 h)
+  sbatch run_aster_slurm.sh -P moyen                     # Préréglage moyen  (24 h)
+  sbatch run_aster_slurm.sh -P long                      # Préréglage long   (72 h)
+  sbatch run_aster_slurm.sh -P moyen -t 8                # Moyen mais 8 tâches MPI
+  sbatch run_aster_slurm.sh -n 2 -t 8 -m 8G             # Personnalisé
+  sbatch run_aster_slurm.sh -p debug -T 01:00:00         # Partition debug, 1h max
+  sbatch run_aster_slurm.sh -C mon_calcul.comm -M maillage.med
 EOF
     exit 0
 }
+
+# ##############################################################################
+# ##############################################################################
+# ##                                                                          ##
+# ##   PHASE 2 : EXÉCUTION SUR LE NŒUD DE CALCUL                             ##
+# ##                                                                          ##
+# ##   Détecté par __ASTER_PHASE=RUN (transmis via sbatch --export)           ##
+# ##   Toutes les variables __ASTER_* contiennent les chemins résolus         ##
+# ##                                                                          ##
+# ##############################################################################
+# ##############################################################################
+
+if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
+
+    # ── Trap : rapatrier les résultats même en cas de scancel / timeout ───────
+    rapatrier() {
+        sep "RAPATRIEMENT DES RÉSULTATS"
+        local dest="$__ASTER_STUDY_DIR"
+        local n=0
+        for f in \
+            "${__ASTER_SCRATCH_DIR}/${__ASTER_STUDY_NAME}.mess" \
+            "${__ASTER_SCRATCH_DIR}/${__ASTER_STUDY_NAME}.resu" \
+            "${__ASTER_SCRATCH_DIR}/${__ASTER_STUDY_NAME}_resu.med"
+        do
+            if [ -f "$f" ] && [ -s "$f" ]; then
+                cp "$f" "$dest/"
+                log "Rapatrié : $(basename "$f")  →  $dest/"
+                (( n++ )) || true
+            fi
+        done
+        # Copier aussi les logs SLURM
+        for f in "${__ASTER_LOG_DIR}"/aster_${SLURM_JOB_ID:-unknown}.{out,err}; do
+            [ -f "$f" ] && cp "$f" "$dest/" 2>/dev/null
+        done
+        [ "$n" -eq 0 ] && log "⚠  Aucun fichier résultat trouvé dans ${__ASTER_SCRATCH_DIR}"
+    }
+    trap rapatrier EXIT
+
+    # ── Infos de démarrage ────────────────────────────────────────────────────
+    sep "DÉBUT CALCUL CODE_ASTER — $(date)"
+    log "Job ID         : $SLURM_JOB_ID"
+    log "Étude          : $__ASTER_STUDY_NAME"
+    log "Scratch        : $__ASTER_SCRATCH_DIR"
+    log "Nœuds alloués  : $SLURM_NODELIST"
+    log "Tâches MPI     : $SLURM_NTASKS"
+    log "CPUs par tâche : $SLURM_CPUS_PER_TASK"
+    log "Mémoire        : $__ASTER_MEM"
+    log "Résultats →    : $__ASTER_STUDY_DIR"
+
+    # ── Chargement de Code_Aster ──────────────────────────────────────────────
+    sep "CHARGEMENT CODE_ASTER"
+
+    if command -v module &>/dev/null && [ -n "${ASTER_MODULE:-}" ]; then
+        module load "${ASTER_MODULE}" 2>/dev/null \
+            && log "Module '${ASTER_MODULE}' chargé." \
+            || log "Module '${ASTER_MODULE}' non disponible."
+    fi
+
+    ASTER_EXE=""
+    for candidate in \
+        "${ASTER_ROOT}/bin/run_aster" \
+        "${ASTER_ROOT}/bin/as_run" \
+        "$(command -v run_aster 2>/dev/null || true)" \
+        "$(command -v as_run   2>/dev/null || true)"
+    do
+        [ -n "$candidate" ] && [ -x "$candidate" ] && { ASTER_EXE="$candidate"; break; }
+    done
+
+    if [ -z "$ASTER_EXE" ]; then
+        log "⚠  Code_Aster introuvable."
+        log "   → Définir ASTER_ROOT=/chemin/code_aster avant de relancer."
+        log "   → Ou créer un module Lmod (ASTER_MODULE)."
+        exit 1
+    fi
+    log "Exécutable : $ASTER_EXE"
+
+    # ── Lancement du calcul ───────────────────────────────────────────────────
+    sep "CALCUL EN COURS"
+    log "Démarrage : $(date)"
+
+    if [ "$SLURM_NTASKS" -gt 1 ]; then
+        log "Mode parallèle MPI ($SLURM_NTASKS processus)"
+        srun --mpi=pmi2 "$ASTER_EXE" "$__ASTER_EXPORT_FILE"
+    else
+        log "Mode séquentiel"
+        "$ASTER_EXE" "$__ASTER_EXPORT_FILE"
+    fi
+    ASTER_RC=$?
+
+    # ── Diagnostic rapide du .mess ────────────────────────────────────────────
+    sep "DIAGNOSTIC"
+    MESS_PATH="${__ASTER_SCRATCH_DIR}/${__ASTER_STUDY_NAME}.mess"
+    if [ -f "$MESS_PATH" ]; then
+        NB_ALARM=$(grep -c "<A>" "$MESS_PATH" 2>/dev/null || echo 0)
+        NB_FATAL=$(grep -c "<F>" "$MESS_PATH" 2>/dev/null || echo 0)
+        NB_EXCEP=$(grep -c "<S>" "$MESS_PATH" 2>/dev/null || echo 0)
+        log "Alarmes <A>        : $NB_ALARM"
+        log "Erreurs fatales <F>: $NB_FATAL"
+        log "Exceptions <S>     : $NB_EXCEP"
+        if [ "$NB_FATAL" -gt 0 ]; then
+            log "--- Première erreur fatale ---"
+            grep -B2 -A5 "<F>" "$MESS_PATH" | head -20
+            log "--- fin ---"
+        fi
+    else
+        log "⚠  Fichier .mess non trouvé (échec au démarrage ?)"
+    fi
+
+    # ── Résumé (le trap EXIT fera le rapatriement) ────────────────────────────
+    sep "RÉSUMÉ FINAL"
+    if [ "$ASTER_RC" -eq 0 ]; then
+        log "Statut    : SUCCÈS ✓"
+    else
+        log "Statut    : ÉCHEC  ✗  (code $ASTER_RC)"
+    fi
+    log "Étude     : $__ASTER_STUDY_NAME"
+    log "Résultats : $__ASTER_STUDY_DIR"
+    log "Scratch   : $__ASTER_SCRATCH_DIR"
+    log "Log       : ${__ASTER_LOG_DIR}/aster_${SLURM_JOB_ID}.out"
+    log "Fin       : $(date)"
+
+    exit $ASTER_RC
+fi
+
+# ##############################################################################
+# ##############################################################################
+# ##                                                                          ##
+# ##   PHASE 1 : PRÉPARATION SUR LE NŒUD LOGIN                               ##
+# ##                                                                          ##
+# ##   Détection fichiers, copie scratch, .export, re-soumission sbatch       ##
+# ##                                                                          ##
+# ##############################################################################
+# ##############################################################################
+
+set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PARSING DES ARGUMENTS
@@ -146,7 +282,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ── Application du préréglage (les options explicites ont priorité) ────────────
+# ── Application du préréglage (les options explicites ont priorité) ───────────
 if [ -n "$PRESET" ]; then
     case "${PRESET,,}" in
         court|short)
@@ -170,9 +306,10 @@ if [ -n "$PRESET" ]; then
             : "${TIME_LIMIT:=$PRESET_LONG_TIME}"
             $QUIET || info "Préréglage : long   (${PRESET_LONG_NTASKS} tâches, ${PRESET_LONG_MEM}, ${PRESET_LONG_TIME})"
             ;;
-        *) err "Préréglage inconnu : '$PRESET'  (valeurs acceptées : court, moyen, long)"; exit 1 ;;
+        *) err "Préréglage inconnu : '$PRESET'  (valeurs : court, moyen, long)"; exit 1 ;;
     esac
 fi
+
 # Valeurs par défaut pour tout paramètre non fixé par option ou préréglage
 : "${PARTITION:=$DEFAULT_PARTITION}"
 : "${NODES:=$DEFAULT_NODES}"
@@ -223,7 +360,7 @@ fi
 [ -n "$MED_FILE" ] && MED_FILE="$(realpath "$MED_FILE")"
 [ -n "$MED_FILE" ] && { $QUIET || ok "Maillage MED  : $MED_FILE"; }
 
-# ── Fichier .mail (format ASTER natif, optionnel) ─────────────────────────────
+# ── Fichier .mail (format ASTER natif, optionnel) ────────────────────────────
 if [ -z "$MAIL_FILE" ]; then
     mapfile -t MAIL_LIST < <(find "$STUDY_DIR" -maxdepth 1 -name "*.mail" | sort)
     case ${#MAIL_LIST[@]} in
@@ -241,7 +378,7 @@ fi
     warn "Aucun maillage (.med ou .mail) — calcul sans maillage externe ?"
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PRÉPARATION DU SCRATCH (nœud login)
+#  PRÉPARATION DU SCRATCH
 # ══════════════════════════════════════════════════════════════════════════════
 $QUIET || section "Préparation du scratch"
 
@@ -252,7 +389,7 @@ LOG_DIR="${SCRATCH_DIR}/logs"
 $QUIET || info "Création : $SCRATCH_DIR"
 mkdir -p "$SCRATCH_DIR" "$LOG_DIR"
 
-# ── Copie des fichiers ────────────────────────────────────────────────────────
+# ── Copie des fichiers ───────────────────────────────────────────────────────
 cp "$COMM_FILE" "$SCRATCH_DIR/"
 $QUIET || ok "Copié : $(basename "$COMM_FILE")"
 
@@ -273,7 +410,9 @@ for ext in py dat para include mfront; do
     done
 done
 
-# ── Génération du fichier .export ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  GÉNÉRATION DU FICHIER .EXPORT
+# ══════════════════════════════════════════════════════════════════════════════
 $QUIET || section "Génération du fichier .export"
 
 COMM_BASENAME="$(basename "$COMM_FILE")"
@@ -284,7 +423,11 @@ MEM_MB=$(echo "$MEM" | awk '/G$/{print $1*1024} /M$/{print $1} /^[0-9]+$/{print 
 ASTER_MEM=$(( MEM_MB - 512 ))
 [ "$ASTER_MEM" -lt 512 ] && ASTER_MEM=512
 
-TIME_LIMIT_SEC=$(echo "$TIME_LIMIT" | awk -F: '{print $1*3600 + $2*60 + $3}')
+# Parsing robuste du temps (accepte HH:MM:SS, MM:SS, ou SS)
+TIME_LIMIT_SEC=$(echo "$TIME_LIMIT" | awk -F: '
+    NF==3 {print $1*3600 + $2*60 + $3; next}
+    NF==2 {print $1*60   + $2;         next}
+           {print $1*60}')
 
 EXPORT_FILE="${SCRATCH_DIR}/${STUDY_NAME}.export"
 {
@@ -323,163 +466,9 @@ if ! $QUIET; then
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GÉNÉRATION DU SCRIPT SBATCH
+#  RE-SOUMISSION DE CE MÊME SCRIPT AVEC LES DIRECTIVES SLURM EN LIGNE
 # ══════════════════════════════════════════════════════════════════════════════
-JOB_SCRIPT="${SCRATCH_DIR}/job.sh"
-
-cat > "$JOB_SCRIPT" <<SBATCH_SCRIPT
-#!/bin/bash
-#SBATCH --job-name=aster_${STUDY_NAME}
-#SBATCH --partition=${PARTITION}
-#SBATCH --nodes=${NODES}
-#SBATCH --ntasks=${NTASKS}
-#SBATCH --cpus-per-task=${CPUS}
-#SBATCH --mem=${MEM}
-#SBATCH --time=${TIME_LIMIT}
-#SBATCH --output=${LOG_DIR}/aster_%j.out
-#SBATCH --error=${LOG_DIR}/aster_%j.err
-
-# Job Code_Aster — généré par run_aster_slurm le $(date)
-# Étude   : ${STUDY_NAME}
-# Scratch : ${SCRATCH_DIR}
-
-# ── Fonctions affichage ───────────────────────────────────────────────────────
-ts()  { date '+%H:%M:%S'; }
-log() { echo "[\$(ts)] \$*"; }
-sep() { echo ""; echo "══════════════════════════════════════════════════════"; echo "  \$*"; echo "══════════════════════════════════════════════════════"; }
-
-# ── Trap : rapatrier les résultats même en cas de scancel / timeout ───────────
-rapatrier() {
-    sep "RAPATRIEMENT DES RÉSULTATS (trap)"
-    local dest="${STUDY_DIR}"
-    local n=0
-    for f in \\
-        "${SCRATCH_DIR}/${STUDY_NAME}.mess" \\
-        "${SCRATCH_DIR}/${STUDY_NAME}.resu" \\
-        "${SCRATCH_DIR}/${STUDY_NAME}_resu.med"
-    do
-        if [ -f "\$f" ] && [ -s "\$f" ]; then
-            cp "\$f" "\$dest/"
-            log "Rapatrié : \$(basename "\$f")  →  \$dest/"
-            (( n++ )) || true
-        fi
-    done
-    # Copier aussi les logs SLURM s'ils existent déjà
-    for f in "${LOG_DIR}"/aster_\${SLURM_JOB_ID:-unknown}.{out,err}; do
-        [ -f "\$f" ] && cp "\$f" "\$dest/" 2>/dev/null
-    done
-    [ "\$n" -eq 0 ] && log "⚠  Aucun fichier résultat trouvé dans ${SCRATCH_DIR}"
-}
-trap rapatrier EXIT
-
-sep "DÉBUT CALCUL CODE_ASTER — \$(date)"
-log "Job ID         : \$SLURM_JOB_ID"
-log "Étude          : ${STUDY_NAME}"
-log "Scratch        : ${SCRATCH_DIR}"
-log "Nœuds alloués  : \$SLURM_NODELIST"
-log "Tâches MPI     : \$SLURM_NTASKS"
-log "CPUs par tâche : \$SLURM_CPUS_PER_TASK"
-log "Mémoire/nœud   : ${MEM}"
-
-# ── Chargement de Code_Aster ──────────────────────────────────────────────────
-sep "CHARGEMENT CODE_ASTER"
-
-if command -v module &>/dev/null && [ -n "${ASTER_MODULE}" ]; then
-    module load "${ASTER_MODULE}" 2>/dev/null \
-        && log "Module '${ASTER_MODULE}' chargé." \
-        || log "Module '${ASTER_MODULE}' non disponible."
-fi
-
-ASTER_EXE=""
-for candidate in \
-    "${ASTER_ROOT}/bin/run_aster" \
-    "${ASTER_ROOT}/bin/as_run" \
-    "\$(command -v run_aster 2>/dev/null)" \
-    "\$(command -v as_run   2>/dev/null)"
-do
-    [ -x "\$candidate" ] && { ASTER_EXE="\$candidate"; break; }
-done
-
-if [ -z "\$ASTER_EXE" ]; then
-    log "⚠  Code_Aster introuvable."
-    log "   → Définir ASTER_ROOT=/chemin/code_aster avant de relancer."
-    log "   → Ou installer Code_Aster et créer un module Lmod."
-    exit 1
-fi
-log "Exécutable : \$ASTER_EXE"
-
-# ── Lancement du calcul ───────────────────────────────────────────────────────
-sep "CALCUL EN COURS"
-log "Démarrage : \$(date)"
-
-if [ "\$SLURM_NTASKS" -gt 1 ]; then
-    log "Mode parallèle MPI (\$SLURM_NTASKS processus)"
-    srun --mpi=pmi2 "\$ASTER_EXE" "${EXPORT_FILE}"
-else
-    log "Mode séquentiel"
-    "\$ASTER_EXE" "${EXPORT_FILE}"
-fi
-ASTER_RC=\$?
-
-# ── Diagnostic rapide du fichier .mess ────────────────────────────────────────
-sep "DIAGNOSTIC"
-MESS_PATH="${SCRATCH_DIR}/${STUDY_NAME}.mess"
-if [ -f "\$MESS_PATH" ]; then
-    NB_ALARM=\$(grep -c "<A>" "\$MESS_PATH" 2>/dev/null || echo 0)
-    NB_FATAL=\$(grep -c "<F>" "\$MESS_PATH" 2>/dev/null || echo 0)
-    NB_EXCEP=\$(grep -c "<S>" "\$MESS_PATH" 2>/dev/null || echo 0)
-    log "Alarmes <A>       : \$NB_ALARM"
-    log "Erreurs fatales <F>: \$NB_FATAL"
-    log "Exceptions <S>    : \$NB_EXCEP"
-    if [ "\$NB_FATAL" -gt 0 ]; then
-        log "--- Première erreur fatale ---"
-        grep -B2 -A5 "<F>" "\$MESS_PATH" | head -20
-        log "--- fin ---"
-    fi
-else
-    log "⚠  Fichier .mess non trouvé (échec au démarrage ?)"
-fi
-
-# ── Résumé (le rapatriement est fait automatiquement par le trap EXIT) ────────
-sep "RÉSUMÉ FINAL"
-if [ "\$ASTER_RC" -eq 0 ]; then
-    log "Statut    : SUCCÈS ✓"
-else
-    log "Statut    : ÉCHEC  ✗  (code \$ASTER_RC)"
-fi
-log "Étude     : ${STUDY_NAME}"
-log "Résultats : ${STUDY_DIR}"
-log "Scratch   : ${SCRATCH_DIR}"
-log "Log       : ${LOG_DIR}/aster_\${SLURM_JOB_ID}.out"
-log "Fin       : \$(date)"
-
-exit \$ASTER_RC
-SBATCH_SCRIPT
-
-chmod +x "$JOB_SCRIPT"
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SOUMISSION Slurm
-# ══════════════════════════════════════════════════════════════════════════════
-$QUIET || section "Soumission Slurm"
-
-JOB_ID=$(sbatch --parsable "$JOB_SCRIPT")
-
-if [ -z "$JOB_ID" ]; then
-    err "Échec de la soumission Slurm."
-    exit 1
-fi
-
-if $QUIET; then
-    echo "$JOB_ID"
-else
-    ok "Job soumis   : ID = ${BOLD}${JOB_ID}${NC}"
-    echo ""
-    echo -e "  ${BOLD}Commandes utiles :${NC}"
-    echo -e "  squeue -j ${JOB_ID}                                   # état du job"
-    echo -e "  tail -f ${LOG_DIR}/aster_${JOB_ID}.out               # logs temps réel"
-    echo -e "  scancel ${JOB_ID}                                      # annuler"
-    echo -e "  ls ${SCRATCH_DIR}/                                    # résultats"
-    echo -e "  ls ${STUDY_DIR}/                                      # résultats rapatriés"
-    echo ""
-fi
+#
+#  Astuce : on ne met PAS de #SBATCH dans le fichier. On passe TOUT en
+#  arguments de la commande sbatch. Ainsi :
+#    - La phase 1 (
