@@ -37,7 +37,7 @@ SCRATCH_BASE="${SCRATCH_BASE:-/scratch}"
 # ── Valeurs par défaut Slurm ─────────────────────────────────────────────────
 DEFAULT_PARTITION="court"
 DEFAULT_NODES=1
-DEFAULT_NTASKS=4
+DEFAULT_NTASKS=1
 DEFAULT_CPUS_PER_TASK=1
 DEFAULT_MEM="5G"
 DEFAULT_TIME="05:00:00"
