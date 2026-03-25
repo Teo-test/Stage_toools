@@ -1,692 +1,508 @@
 #!/bin/bash
 #===============================================================================
-#  run_aster — Calcul Code_Aster via sbatch (fichier unique)
+#  run_aster.sh — Soumission de calculs Code_Aster via Slurm
 #===============================================================================
 #
 #  Usage :  bash run_aster.sh [OPTIONS] [DOSSIER_ETUDE]
 #
-#  Le script fonctionne en DEUX PHASES dans un seul fichier :
+#  Ce script fonctionne en deux phases dans un seul fichier :
 #
-#    PHASE 1 (noeud login) : preparation, copie scratch, .export, sbatch
-#    PHASE 2 (noeud de calcul) : chargement Aster, calcul, rapatriement
+#    Phase 1 (noeud login)  : detecte les fichiers, prepare le scratch,
+#                             genere le .export, soumet via sbatch.
 #
-#  Auteur   : Teo LEROY
-#  Version  : 8.3
+#    Phase 2 (noeud calcul) : charge Code_Aster, lance le calcul,
+#                             rapatrie les resultats, nettoie le scratch.
+#
+#  Notes sur run_aster et la gestion de la base :
+#    - run_aster cree son propre repertoire de travail temporaire interne.
+#    - Quand on declare "F base /chemin/dossier D 0", run_aster copie le
+#      DOSSIER dans son rep de travail, puis deplace tout son contenu
+#      (glob.*, pick.*, vola.*) a la racine. C'est pour cela que -B
+#      prend un dossier, pas un fichier.
+#    - run_aster gere MPI en interne : ne PAS l'appeler via srun.
+#
+#  Auteur  : Teo LEROY
+#  Version : 9.0
 #===============================================================================
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION — modifier ici selon l'installation
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════
+#  CONFIGURATION
+# ══════════════════════════════════════════
 
 ASTER_ROOT="${ASTER_ROOT:-/opt/code_aster}"
 ASTER_MODULE="${ASTER_MODULE:-code_aster}"
 SCRATCH_BASE="${SCRATCH_BASE:-/scratch}"
 
-# ── Valeurs par defaut Slurm ─────────────────────────────────────────────────
 DEFAULT_PARTITION="court"
 DEFAULT_NODES=1
 DEFAULT_NTASKS=1
-DEFAULT_CPUS_PER_TASK=1
+DEFAULT_CPUS=1
 DEFAULT_MEM="5G"
 DEFAULT_TIME="05:00:00"
 
-# ── Prereglages ──────────────────────────────────────────────────────────────
-PRESET_COURT_PARTITION="court"  ; PRESET_COURT_NTASKS=1 ; PRESET_COURT_MEM="2G"  ; PRESET_COURT_TIME="05:00:00"
-PRESET_MOYEN_PARTITION="moyen"  ; PRESET_MOYEN_NTASKS=1 ; PRESET_MOYEN_MEM="8G"  ; PRESET_MOYEN_TIME="03-00:00:00"
-PRESET_LONG_PARTITION="long"    ; PRESET_LONG_NTASKS=1  ; PRESET_LONG_MEM="32G"  ; PRESET_LONG_TIME="30-00:00:00"
+PRESET_COURT_PARTITION="court"  ; PRESET_COURT_NTASKS=1  ; PRESET_COURT_MEM="2G"  ; PRESET_COURT_TIME="05:00:00"
+PRESET_MOYEN_PARTITION="moyen"  ; PRESET_MOYEN_NTASKS=1  ; PRESET_MOYEN_MEM="8G"  ; PRESET_MOYEN_TIME="03-00:00:00"
+PRESET_LONG_PARTITION="long"    ; PRESET_LONG_NTASKS=1   ; PRESET_LONG_MEM="32G"  ; PRESET_LONG_TIME="30-00:00:00"
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  AFFICHAGE
-# ══════════════════════════════════════════════════════════════════════════════
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+# ══════════════════════════════════════════
+#  FONCTIONS D'AFFICHAGE
+# ══════════════════════════════════════════
 
-info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
-ok()      { echo -e "${GREEN}[ OK ]${NC}  $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-err()     { echo -e "${RED}[ ERR]${NC}  $*" >&2; }
-section() { echo -e "\n${BOLD}${CYAN}> $*${NC}"; echo -e "${CYAN}$(printf -- '-%.0s' {1..60})${NC}"; }
-ts()      { date '+%H:%M:%S'; }
-log()     { echo "[$(ts)] $*"; }
-sep()     { echo ""; echo "======================================================"; echo "  $*"; echo "======================================================"; }
+info() { echo -e "\033[0;34m[INFO]\033[0m  $*"; }
+ok()   { echo -e "\033[0;32m[ OK ]\033[0m  $*"; }
+warn() { echo -e "\033[1;33m[WARN]\033[0m  $*"; }
+err()  { echo -e "\033[0;31m[ ERR]\033[0m  $*" >&2; }
+log()  { echo "[$(date +%H:%M:%S)] $*"; }
+header() {
+    echo ""
+    echo "========================================================"
+    echo "  $*"
+    echo "========================================================"
+}
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════
 #  AIDE
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════
+
 usage() {
-    cat <<EOF
+    cat <<'EOF'
 USAGE
   bash run_aster.sh [OPTIONS] [DOSSIER_ETUDE]
 
-  Lance un calcul Code_Aster via Slurm.
-  Par defaut, DOSSIER_ETUDE = repertoire courant.
-  Le scratch est automatiquement supprime apres rapatriement.
-
 FICHIERS
-  -C, --comm FILE      Fichier .comm  (auto-detecte si absent)
-  -M, --med  FILE      Fichier .med   (auto-detecte si absent)
-  -A, --mail FILE      Fichier .mail  (auto-detecte si absent)
+  -C, --comm FILE       Fichier .comm (auto-detecte si absent)
+  -M, --med  FILE       Fichier .med  (auto-detecte si absent)
+  -A, --mail FILE       Fichier .mail (auto-detecte si absent)
 
-POURSUITE / ENCHAINEMENT
-  --save-base          Sauvegarder la base Aster (glob.*, pick.*, vola.*)
-                       dans run_JOBID/base/ apres le calcul.
-                       Indispensable si un calcul suivant utilise POURSUITE().
+POURSUITE
+  --save-base           Sauvegarder la base (glob/pick/vola) apres le calcul
+  -B, --base DOSSIER    Dossier contenant glob.*/pick.*/vola.* d'un calcul
+                        precedent (pour POURSUITE)
 
-  -B, --base DOSSIER   Dossier contenant la base d'un calcul precedent
-                       (glob.*, pick.*, vola.*) pour POURSUITE().
-                       Typiquement : ~/etude_thermo/latest/base
-
-  Workflow couplage thermo-meca :
-    1. bash run_aster.sh --save-base -P moyen ~/etude_thermo/
-    2. bash run_aster.sh -B ~/etude_thermo/latest/base -P moyen ~/etude_meca/
-
-  Enchainer 3 calculs :
-    1. bash run_aster.sh --save-base ~/etape1/
-    2. bash run_aster.sh --save-base -B ~/etape1/latest/base ~/etape2/
-    3. bash run_aster.sh -B ~/etape2/latest/base ~/etape3/
+  Exemples :
+    bash run_aster.sh --save-base ~/thermo/            # sauver la base
+    bash run_aster.sh -B ~/thermo/latest/base ~/meca/  # reprendre la base
 
 RESULTATS SUPPLEMENTAIRES
-  -R, --results LIST   Unites additionnelles. Format : "type:unite,..."
-                        Types : rmed, resu, mess, csv, table, dat, pos
-                        Exemple : --results "rmed:81,csv:38"
+  -R, --results LIST    Format "type:unite,..." (ex: "rmed:81,csv:38")
 
 RESSOURCES SLURM
-  -p, --partition NOM  Partition        [defaut: ${DEFAULT_PARTITION}]
-  -n, --nodes     N    Nombre de noeuds [defaut: ${DEFAULT_NODES}]
-  -t, --ntasks    N    Taches MPI       [defaut: ${DEFAULT_NTASKS}]
-  -c, --cpus      N    CPUs par tache   [defaut: ${DEFAULT_CPUS_PER_TASK}]
-  -m, --mem       MEM  Memoire/noeud    [defaut: ${DEFAULT_MEM}]
-  -T, --time  H:M:S    Duree max        [defaut: ${DEFAULT_TIME}]
-
-PREREGLAGES
-  -P, --preset NOM     court, moyen, long (surchargeable par options)
+  -P, --preset  NOM     court, moyen ou long
+  -p, --partition NOM   Partition Slurm
+  -n, --nodes N         Nombre de noeuds
+  -t, --ntasks N        Taches MPI
+  -c, --cpus N          CPUs par tache
+  -m, --mem MEM         Memoire (ex: 8G)
+  -T, --time H:M:S      Duree max
 
 OPTIONS
-  -q, --quiet          Sortie minimale (juste le job ID)
-      --keep-scratch   Ne pas supprimer le scratch apres rapatriement
-      --dry-run        Afficher la commande sbatch sans la lancer
-      --debug          Activer set -x en phase d'execution
-  -h, --help           Afficher cette aide
+  -q, --quiet           Sortie minimale
+      --keep-scratch    Ne pas supprimer le scratch
+      --dry-run         Afficher sans lancer
+      --debug           Mode verbose (set -x)
+  -h, --help            Afficher cette aide
 EOF
     exit 0
 }
 
-# ##############################################################################
-# ##                                                                          ##
-# ##   PHASE 2 : EXECUTION SUR LE NOEUD DE CALCUL                            ##
-# ##                                                                          ##
-# ##############################################################################
+# ##########################################################################
+#
+#   PHASE 2 — NOEUD DE CALCUL
+#
+# ##########################################################################
 
-if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
+if [ "${__RUN_PHASE:-}" = "EXEC" ]; then
 
     set -uo pipefail
-    [ "${__ASTER_DEBUG:-0}" = "1" ] && set -x
+    [ "${__DEBUG:-0}" = "1" ] && set -x
 
-    __RAPATRIE_DONE=0
+    ALREADY_COLLECTED=0
 
-    _rsync_result() {
-        local src="$1" dest="$2"
-        if rsync -av "$src" "$dest/" > >(while read -r l; do log "$l"; done) 2>&1; then
-            return 0
-        else
-            log "!! Echec rsync : $src -> $dest"
-            return 1
-        fi
-    }
+    collect_results() {
+        [ "$ALREADY_COLLECTED" -eq 1 ] && return
+        ALREADY_COLLECTED=1
 
-    rapatrier() {
-        if [ "$__RAPATRIE_DONE" -eq 1 ]; then return; fi
-        __RAPATRIE_DONE=1
+        header "RAPATRIEMENT"
 
-        sep "RAPATRIEMENT DES RESULTATS"
+        local dest="${__STUDY_DIR}/run_${SLURM_JOB_ID}"
+        mkdir -p "$dest" || { log "!! Impossible de creer $dest"; return; }
 
-        local dest="${__ASTER_STUDY_DIR}/run_${SLURM_JOB_ID}"
-        local n=0
+        local count=0
 
-        if ! mkdir -p "$dest" 2>/dev/null; then
-            log "!! Impossible de creer $dest"
-            return
-        fi
-        log "Destination : $dest"
-
-        # Rapatrier les fichiers de resultat par extension
-        shopt -s nullglob
+        # Resultats classiques
         for ext in mess resu med csv table dat pos rmed txt vtu vtk py; do
-            for f in "${__ASTER_SCRATCH_DIR}"/*."${ext}"; do
-                if [ -f "$f" ] && [ -s "$f" ]; then
-                    _rsync_result "$f" "$dest" && (( n++ )) || true
-                fi
+            for f in "${__SCRATCH}"/*."${ext}"; do
+                [ -f "$f" ] && [ -s "$f" ] && cp -v "$f" "$dest/" && (( count++ ))
             done
-        done
-        shopt -u nullglob
+        done 2>/dev/null
 
-        # Rapatrier REPE_OUT si present
-        if [ -d "${__ASTER_SCRATCH_DIR}/REPE_OUT" ]; then
-            _rsync_result "${__ASTER_SCRATCH_DIR}/REPE_OUT" "$dest" && (( n++ )) || true
-        fi
+        # REPE_OUT
+        [ -d "${__SCRATCH}/REPE_OUT" ] && cp -rv "${__SCRATCH}/REPE_OUT" "$dest/" && (( count++ )) 2>/dev/null
 
-        # Rapatrier la base (glob.*, pick.*, vola.*) dans un sous-dossier base/
-        # Uniquement si --save-base a ete demande
-        if [ "${__ASTER_SAVE_BASE:-0}" = "1" ]; then
+        # Base (glob/pick/vola) si --save-base
+        if [ "${__SAVE_BASE:-0}" = "1" ]; then
             local base_dest="${dest}/base"
-            mkdir -p "$base_dest" 2>/dev/null
-            shopt -s nullglob
-            local base_count=0
-            for f in "${__ASTER_SCRATCH_DIR}"/glob.* \
-                     "${__ASTER_SCRATCH_DIR}"/pick.* \
-                     "${__ASTER_SCRATCH_DIR}"/vola.*; do
-                if [ -f "$f" ] && [ -s "$f" ]; then
-                    _rsync_result "$f" "$base_dest" && (( base_count++ )) || true
-                fi
-            done
-            shopt -u nullglob
-            if [ "$base_count" -gt 0 ]; then
-                log "OK $base_count fichier(s) base rapatrie(s) vers $base_dest"
-                (( n += base_count ))
+            mkdir -p "$base_dest"
+            local bc=0
+            for f in "${__SCRATCH}"/glob.* "${__SCRATCH}"/pick.* "${__SCRATCH}"/vola.*; do
+                [ -f "$f" ] && [ -s "$f" ] && cp -v "$f" "$base_dest/" && (( bc++ ))
+            done 2>/dev/null
+            if [ "$bc" -gt 0 ]; then
+                log "$bc fichier(s) base sauves dans $base_dest"
+                (( count += bc ))
             else
-                log "!! Aucun fichier base (glob.*, pick.*, vola.*) trouve dans le scratch"
-                log "   Le calcul a peut-etre echoue avant de generer la base."
+                log "!! Aucun fichier base trouve (glob/pick/vola)"
+                log "   Contenu du scratch :"
+                ls -la "${__SCRATCH}/" 2>/dev/null
             fi
         fi
 
-        if [ "$n" -eq 0 ]; then
-            log "!! Aucun fichier resultat trouve"
-            ls -la "${__ASTER_SCRATCH_DIR}/" 2>/dev/null | while IFS= read -r l; do log "   $l"; done
+        # Lien latest
+        rm -f "${__STUDY_DIR}/latest" 2>/dev/null
+        ln -s "run_${SLURM_JOB_ID}" "${__STUDY_DIR}/latest" 2>/dev/null
+
+        log "$count fichier(s) rapatrie(s) -> $dest"
+
+        # Nettoyage
+        if [ "${__KEEP_SCRATCH:-0}" != "1" ]; then
+            rm -rf "$__SCRATCH" 2>/dev/null && log "Scratch supprime"
         else
-            log "OK $n fichier(s) rapatrie(s) au total vers $dest"
-        fi
-
-        log ""
-        log "Resultats dans : $dest"
-        shopt -s nullglob
-        for f in "$dest"/*; do
-            log "  $(ls -lh "$f")"
-        done
-        shopt -u nullglob
-
-        # Lien symbolique latest
-        local latest_link="${__ASTER_STUDY_DIR}/latest"
-        rm -f "$latest_link" 2>/dev/null
-        ln -s "run_${SLURM_JOB_ID}" "$latest_link" 2>/dev/null && \
-            log "OK Lien : latest -> run_${SLURM_JOB_ID}"
-
-        # Nettoyage scratch
-        if [ "${__ASTER_KEEP_SCRATCH:-0}" != "1" ]; then
-            log ""
-            log "Nettoyage du scratch..."
-            rm -rf "$__ASTER_SCRATCH_DIR" 2>/dev/null && log "OK Scratch supprime" || \
-                log "!! Echec suppression scratch"
-        else
-            log "Scratch conserve : $__ASTER_SCRATCH_DIR"
+            log "Scratch conserve : $__SCRATCH"
         fi
     }
 
-    trap rapatrier EXIT
-    trap 'rapatrier; exit 143' SIGTERM
+    trap collect_results EXIT
+    trap 'collect_results; exit 143' SIGTERM
 
-    # ── Infos de demarrage ────────────────────────────────────────────────────
-    sep "DEBUT CALCUL CODE_ASTER -- $(date)"
-    log "Job ID         : $SLURM_JOB_ID"
-    log "Etude          : $__ASTER_STUDY_NAME"
-    log "Scratch        : $__ASTER_SCRATCH_DIR"
-    log "Noeuds         : $SLURM_NODELIST"
-    log "Taches MPI     : $SLURM_NTASKS"
-    log "Memoire        : $__ASTER_MEM"
-    log "Save base      : ${__ASTER_SAVE_BASE:-0}"
-    log "Base poursuite : ${__ASTER_BASE_DIR:-aucune}"
+    # --- Demarrage ---
+    header "CODE_ASTER — $(date)"
+    log "Job       : $SLURM_JOB_ID"
+    log "Noeud     : $SLURM_NODELIST"
+    log "Scratch   : $__SCRATCH"
+    log "Save base : ${__SAVE_BASE:-0}"
+    log "Base in   : ${__BASE_DIR:-aucune}"
 
-    # ── Chargement de Code_Aster ──────────────────────────────────────────────
-    sep "CHARGEMENT CODE_ASTER"
-
-    ASTER_LOADED=0
-    if command -v module &>/dev/null && [ -n "${__ASTER_MODULE:-}" ]; then
-        if module load "${__ASTER_MODULE}" 2>/dev/null; then
-            log "Module '${__ASTER_MODULE}' charge."
-            ASTER_LOADED=1
-        else
-            warn "Module '${__ASTER_MODULE}' non disponible."
-        fi
+    # --- Module ---
+    if command -v module &>/dev/null && [ -n "${__MODULE:-}" ]; then
+        module load "$__MODULE" 2>&1 && log "Module '$__MODULE' charge" \
+                                     || warn "Module '$__MODULE' echec"
     fi
 
-    ASTER_EXE=""
-    for candidate in \
-        "${__ASTER_ROOT}/bin/run_aster" \
-        "${__ASTER_ROOT}/bin/as_run" \
-        "$(command -v run_aster 2>/dev/null || true)" \
-        "$(command -v as_run   2>/dev/null || true)"
-    do
-        [ -n "$candidate" ] && [ -x "$candidate" ] && { ASTER_EXE="$candidate"; break; }
+    # --- Executable ---
+    EXE=""
+    for c in "${__ASTER_ROOT}/bin/run_aster" \
+             "${__ASTER_ROOT}/bin/as_run" \
+             "$(command -v run_aster 2>/dev/null || true)" \
+             "$(command -v as_run 2>/dev/null || true)"; do
+        [ -n "$c" ] && [ -x "$c" ] && { EXE="$c"; break; }
     done
+    [ -z "$EXE" ] && { err "Code_Aster introuvable"; exit 1; }
+    log "Executable : $EXE"
+    "$EXE" --version 2>&1 | head -1 | while read -r l; do log "Version : $l"; done
 
-    if [ -z "$ASTER_EXE" ]; then
-        err "Code_Aster introuvable."
-        exit 1
+    # --- Debug : contenu scratch + export ---
+    header "VERIFICATION"
+    log "Contenu scratch :"
+    ls -la "$__SCRATCH/" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
+    if [ -d "${__SCRATCH}/base_in" ]; then
+        log "Contenu base_in/ :"
+        ls -la "${__SCRATCH}/base_in/" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
     fi
-    log "Executable : $ASTER_EXE"
-
-    if [ "$ASTER_LOADED" -eq 0 ] && [ -n "${__ASTER_MODULE:-}" ]; then
-        warn "Module non charge -- le binaire pourrait ne pas avoir le bon environnement."
-    fi
-
-    ASTER_VERSION=$("$ASTER_EXE" --version 2>&1 | head -1) || true
-    [ -n "$ASTER_VERSION" ] && log "Version : $ASTER_VERSION"
-
-    # ── Debug : contenu du scratch avant lancement ────────────────────────────
-    sep "CONTENU SCRATCH"
-    ls -la "$__ASTER_SCRATCH_DIR/" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
     log ""
-    log "Contenu du .export :"
-    cat "$__ASTER_EXPORT_FILE" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
+    log "Contenu .export :"
+    cat "$__EXPORT" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
 
-    # ── Lancement ─────────────────────────────────────────────────────────────
-    sep "CALCUL EN COURS"
-    log "Demarrage : $(date)"
-
-    ASTER_RC=0
+    # --- Calcul ---
+    header "CALCUL"
+    log "Lancement : $(date)"
+    RC=0
     set +e
-    log "Commande : $ASTER_EXE $__ASTER_EXPORT_FILE"
-    "$ASTER_EXE" "$__ASTER_EXPORT_FILE"
-    ASTER_RC=$?
+    "$EXE" "$__EXPORT"
+    RC=$?
     set -e
-    log "Execution terminee : $(date) -- code retour : $ASTER_RC"
+    log "Termine : $(date) — code retour $RC"
 
-    # ── Diagnostic .mess ──────────────────────────────────────────────────────
-    sep "DIAGNOSTIC"
-    MESS_PATH="${__ASTER_SCRATCH_DIR}/${__ASTER_STUDY_NAME}.mess"
-    NB_ALARM=0; NB_FATAL=0; NB_EXCEP=0
-    if [ -f "$MESS_PATH" ]; then
-        NB_ALARM=$(grep -c "<A>" "$MESS_PATH" 2>/dev/null || true)
-        NB_FATAL=$(grep -c "<F>" "$MESS_PATH" 2>/dev/null || true)
-        NB_EXCEP=$(grep -c "<S>" "$MESS_PATH" 2>/dev/null || true)
-        log "Alarmes <A> : $NB_ALARM | Fatales <F> : $NB_FATAL | Exceptions <S> : $NB_EXCEP"
-        if [ "$NB_FATAL" -gt 0 ]; then
-            log "--- Premiere erreur fatale ---"
-            grep -B2 -A5 "<F>" "$MESS_PATH" | head -20 || true
-            log "--- fin ---"
-        fi
-        if [ "$NB_EXCEP" -gt 0 ]; then
-            log "--- Premiere exception ---"
-            grep -B2 -A5 "<S>" "$MESS_PATH" | head -20 || true
-            log "--- fin ---"
-        fi
+    # --- Diagnostic .mess ---
+    header "DIAGNOSTIC"
+    MESS="${__SCRATCH}/${__STUDY_NAME}.mess"
+    if [ -f "$MESS" ]; then
+        NA=$(grep -c "<A>" "$MESS" 2>/dev/null || true)
+        NF=$(grep -c "<F>" "$MESS" 2>/dev/null || true)
+        NS=$(grep -c "<S>" "$MESS" 2>/dev/null || true)
+        log "Alarmes <A>:$NA  Fatales <F>:$NF  Exceptions <S>:$NS"
+        [ "$NF" -gt 0 ] && { grep -B2 -A5 "<F>" "$MESS" | head -20; }
+        [ "$NS" -gt 0 ] && [ "$NF" -eq 0 ] && { grep -B2 -A5 "<S>" "$MESS" | head -20; }
     else
-        log "!! Fichier .mess non trouve"
-        ls -la "${__ASTER_SCRATCH_DIR}/" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
+        log "!! Pas de .mess"
+        ls -la "$__SCRATCH/" 2>/dev/null
     fi
 
-    rapatrier
+    # --- Contenu scratch apres calcul (pour debug) ---
+    log ""
+    log "Contenu scratch apres calcul :"
+    ls -la "$__SCRATCH/" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
 
-    # ── sacct ─────────────────────────────────────────────────────────────────
-    sep "RESSOURCES UTILISEES"
-    if command -v sacct &>/dev/null; then
-        sacct -j "$SLURM_JOB_ID" \
-              --format=JobID,JobName%20,Elapsed,CPUTime,MaxRSS,MaxVMSize,State,ExitCode \
-              2>/dev/null | while IFS= read -r l; do log "$l"; done \
-            || log "!! sacct non disponible"
-    fi
+    collect_results
 
-    sep "RESUME FINAL"
-    [ "$ASTER_RC" -eq 0 ] && log "Statut : SUCCES" || log "Statut : ECHEC (code $ASTER_RC)"
-    log "Resultats : ${__ASTER_STUDY_DIR}/run_${SLURM_JOB_ID}"
-    log "Fin : $(date)"
+    header "FIN"
+    [ "$RC" -eq 0 ] && log "SUCCES" || log "ECHEC (code $RC)"
+    log "Resultats : ${__STUDY_DIR}/run_${SLURM_JOB_ID}"
 
-    exit $ASTER_RC
+    exit $RC
 fi
 
-# ##############################################################################
-# ##                                                                          ##
-# ##   PHASE 1 : PREPARATION SUR LE NOEUD LOGIN                              ##
-# ##                                                                          ##
-# ##############################################################################
+# ##########################################################################
+#
+#   PHASE 1 — NOEUD LOGIN
+#
+# ##########################################################################
 
 set -euo pipefail
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PARSING DES ARGUMENTS
-# ══════════════════════════════════════════════════════════════════════════════
+# --- Arguments ---
 STUDY_DIR="."
-COMM_FILE=""
-MED_FILE=""
-MAIL_FILE=""
-BASE_DIR=""
-PRESET=""
-PARTITION=""
-NODES=""
-NTASKS=""
-CPUS=""
-MEM=""
-TIME_LIMIT=""
-QUIET=false
-RESULT_UNITS=""
-OPT_KEEP_SCRATCH=0
-OPT_DRY_RUN=0
-OPT_DEBUG=0
-OPT_SAVE_BASE=0
+COMM="" ; MED="" ; MAIL="" ; BASE_DIR=""
+PRESET="" ; PARTITION="" ; NODES="" ; NTASKS="" ; CPUS="" ; MEM="" ; TIME_LIMIT=""
+QUIET=false ; RESULTS="" ; KEEP_SCRATCH=0 ; DRY_RUN=0 ; DEBUG=0 ; SAVE_BASE=0
 
-while [[ $# -gt 0 ]]; do
+while [ $# -gt 0 ]; do
     case "$1" in
-        -C|--comm)          COMM_FILE="$2";       shift 2 ;;
-        -M|--med)           MED_FILE="$2";        shift 2 ;;
-        -A|--mail)          MAIL_FILE="$2";       shift 2 ;;
-        -B|--base)          BASE_DIR="$2";        shift 2 ;;
-        -R|--results)       RESULT_UNITS="$2";    shift 2 ;;
-        -P|--preset)        PRESET="$2";          shift 2 ;;
-        -p|--partition)     PARTITION="$2";       shift 2 ;;
-        -n|--nodes)         NODES="$2";           shift 2 ;;
-        -t|--ntasks)        NTASKS="$2";          shift 2 ;;
-        -c|--cpus)          CPUS="$2";            shift 2 ;;
-        -m|--mem)           MEM="$2";             shift 2 ;;
-        -T|--time)          TIME_LIMIT="$2";      shift 2 ;;
-        -q|--quiet)         QUIET=true;           shift ;;
-        --save-base)        OPT_SAVE_BASE=1;      shift ;;
-        --keep-scratch)     OPT_KEEP_SCRATCH=1;   shift ;;
-        --dry-run)          OPT_DRY_RUN=1;        shift ;;
-        --debug)            OPT_DEBUG=1;          shift ;;
-        -h|--help)          usage ;;
-        -*)                 err "Option inconnue : $1"; echo ""; usage ;;
-        *)                  STUDY_DIR="$1";       shift ;;
+        -C|--comm)      COMM="$2";         shift 2 ;;
+        -M|--med)       MED="$2";          shift 2 ;;
+        -A|--mail)      MAIL="$2";         shift 2 ;;
+        -B|--base)      BASE_DIR="$2";     shift 2 ;;
+        -R|--results)   RESULTS="$2";      shift 2 ;;
+        -P|--preset)    PRESET="$2";       shift 2 ;;
+        -p|--partition) PARTITION="$2";    shift 2 ;;
+        -n|--nodes)     NODES="$2";        shift 2 ;;
+        -t|--ntasks)    NTASKS="$2";       shift 2 ;;
+        -c|--cpus)      CPUS="$2";         shift 2 ;;
+        -m|--mem)       MEM="$2";          shift 2 ;;
+        -T|--time)      TIME_LIMIT="$2";   shift 2 ;;
+        -q|--quiet)     QUIET=true;        shift ;;
+        --save-base)    SAVE_BASE=1;       shift ;;
+        --keep-scratch) KEEP_SCRATCH=1;    shift ;;
+        --dry-run)      DRY_RUN=1;         shift ;;
+        --debug)        DEBUG=1;           shift ;;
+        -h|--help)      usage ;;
+        -*)             err "Option inconnue : $1"; usage ;;
+        *)              STUDY_DIR="$1";    shift ;;
     esac
 done
 
-# ── Prereglages ───────────────────────────────────────────────────────────────
+# --- Presets ---
 if [ -n "$PRESET" ]; then
     case "${PRESET,,}" in
-        court|short)
-            : "${PARTITION:=$PRESET_COURT_PARTITION}"; : "${NTASKS:=$PRESET_COURT_NTASKS}"
-            : "${MEM:=$PRESET_COURT_MEM}"; : "${TIME_LIMIT:=$PRESET_COURT_TIME}"
-            $QUIET || info "Prereglage : court"
-            ;;
-        moyen|medium)
-            : "${PARTITION:=$PRESET_MOYEN_PARTITION}"; : "${NTASKS:=$PRESET_MOYEN_NTASKS}"
-            : "${MEM:=$PRESET_MOYEN_MEM}"; : "${TIME_LIMIT:=$PRESET_MOYEN_TIME}"
-            $QUIET || info "Prereglage : moyen"
-            ;;
-        long)
-            : "${PARTITION:=$PRESET_LONG_PARTITION}"; : "${NTASKS:=$PRESET_LONG_NTASKS}"
-            : "${MEM:=$PRESET_LONG_MEM}"; : "${TIME_LIMIT:=$PRESET_LONG_TIME}"
-            $QUIET || info "Prereglage : long"
-            ;;
-        *) err "Prereglage inconnu : '$PRESET'"; exit 1 ;;
+        court|short)  : "${PARTITION:=$PRESET_COURT_PARTITION}"; : "${NTASKS:=$PRESET_COURT_NTASKS}"; : "${MEM:=$PRESET_COURT_MEM}"; : "${TIME_LIMIT:=$PRESET_COURT_TIME}" ;;
+        moyen|medium) : "${PARTITION:=$PRESET_MOYEN_PARTITION}"; : "${NTASKS:=$PRESET_MOYEN_NTASKS}"; : "${MEM:=$PRESET_MOYEN_MEM}"; : "${TIME_LIMIT:=$PRESET_MOYEN_TIME}" ;;
+        long)         : "${PARTITION:=$PRESET_LONG_PARTITION}";  : "${NTASKS:=$PRESET_LONG_NTASKS}";  : "${MEM:=$PRESET_LONG_MEM}";  : "${TIME_LIMIT:=$PRESET_LONG_TIME}" ;;
+        *) err "Preset inconnu : $PRESET"; exit 1 ;;
     esac
+    $QUIET || info "Preset : $PRESET"
 fi
+: "${PARTITION:=$DEFAULT_PARTITION}"; : "${NODES:=$DEFAULT_NODES}"
+: "${NTASKS:=$DEFAULT_NTASKS}"; : "${CPUS:=$DEFAULT_CPUS}"
+: "${MEM:=$DEFAULT_MEM}"; : "${TIME_LIMIT:=$DEFAULT_TIME}"
 
-: "${PARTITION:=$DEFAULT_PARTITION}"
-: "${NODES:=$DEFAULT_NODES}"
-: "${NTASKS:=$DEFAULT_NTASKS}"
-: "${CPUS:=$DEFAULT_CPUS_PER_TASK}"
-: "${MEM:=$DEFAULT_MEM}"
-: "${TIME_LIMIT:=$DEFAULT_TIME}"
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  DETECTION DES FICHIERS
-# ══════════════════════════════════════════════════════════════════════════════
-$QUIET || section "Detection de l'etude"
+# --- Detection des fichiers ---
+$QUIET || info "=== Detection ==="
 
 STUDY_DIR="$(realpath "$STUDY_DIR")"
 STUDY_NAME="$(basename "$STUDY_DIR")"
 [ -d "$STUDY_DIR" ] || { err "Dossier introuvable : $STUDY_DIR"; exit 1; }
-$QUIET || info "Dossier : $STUDY_DIR"
-$QUIET || info "Etude   : $STUDY_NAME"
 
 # .comm
-if [ -z "$COMM_FILE" ]; then
-    shopt -s nullglob; COMM_LIST=("$STUDY_DIR"/*.comm); shopt -u nullglob
-    case ${#COMM_LIST[@]} in
-        0) err "Aucun .comm dans $STUDY_DIR"; exit 1 ;;
-        1) COMM_FILE="${COMM_LIST[0]}" ;;
-        *) warn "Plusieurs .comm -- selection du premier"; COMM_FILE="${COMM_LIST[0]}" ;;
-    esac
+if [ -z "$COMM" ]; then
+    shopt -s nullglob; arr=("$STUDY_DIR"/*.comm); shopt -u nullglob
+    [ ${#arr[@]} -eq 0 ] && { err "Aucun .comm dans $STUDY_DIR"; exit 1; }
+    [ ${#arr[@]} -gt 1 ] && warn "Plusieurs .comm, utilisation du premier"
+    COMM="${arr[0]}"
 fi
-COMM_FILE="$(realpath "$COMM_FILE")"
-[ -f "$COMM_FILE" ] || { err ".comm introuvable : $COMM_FILE"; exit 1; }
-$QUIET || ok "Comm : $COMM_FILE"
+COMM="$(realpath "$COMM")"
+$QUIET || ok "Comm : $COMM"
 
 # .med
-if [ -z "$MED_FILE" ]; then
-    shopt -s nullglob; MED_LIST=("$STUDY_DIR"/*.med); shopt -u nullglob
-    case ${#MED_LIST[@]} in
-        0) : ;; 1) MED_FILE="${MED_LIST[0]}" ;;
-        *) warn "Plusieurs .med -- selection du premier"; MED_FILE="${MED_LIST[0]}" ;;
-    esac
+if [ -z "$MED" ]; then
+    shopt -s nullglob; arr=("$STUDY_DIR"/*.med); shopt -u nullglob
+    [ ${#arr[@]} -ge 1 ] && MED="${arr[0]}"
+    [ ${#arr[@]} -gt 1 ] && warn "Plusieurs .med, utilisation du premier"
 fi
-[ -n "$MED_FILE" ] && MED_FILE="$(realpath "$MED_FILE")"
-[ -n "$MED_FILE" ] && { $QUIET || ok "Med  : $MED_FILE"; }
+[ -n "$MED" ] && { MED="$(realpath "$MED")"; $QUIET || ok "Med  : $MED"; }
 
 # .mail
-if [ -z "$MAIL_FILE" ]; then
-    shopt -s nullglob; MAIL_LIST=("$STUDY_DIR"/*.mail); shopt -u nullglob
-    case ${#MAIL_LIST[@]} in
-        0) : ;; 1) MAIL_FILE="${MAIL_LIST[0]}" ;;
-        *) warn "Plusieurs .mail -- selection du premier"; MAIL_FILE="${MAIL_LIST[0]}" ;;
-    esac
+if [ -z "$MAIL" ]; then
+    shopt -s nullglob; arr=("$STUDY_DIR"/*.mail); shopt -u nullglob
+    [ ${#arr[@]} -ge 1 ] && MAIL="${arr[0]}"
 fi
-[ -n "$MAIL_FILE" ] && MAIL_FILE="$(realpath "$MAIL_FILE")"
-[ -n "$MAIL_FILE" ] && { $QUIET || ok "Mail : $MAIL_FILE"; }
+[ -n "$MAIL" ] && { MAIL="$(realpath "$MAIL")"; $QUIET || ok "Mail : $MAIL"; }
 
-[ -z "$MED_FILE" ] && [ -z "$MAIL_FILE" ] && warn "Aucun maillage detecte"
-
-# Base de poursuite (-B dossier)
+# Base de poursuite
 if [ -n "$BASE_DIR" ]; then
     BASE_DIR="$(realpath "$BASE_DIR")"
-    [ -d "$BASE_DIR" ] || { err "Dossier base introuvable : $BASE_DIR"; exit 1; }
-    if [ ! -f "$BASE_DIR/glob.1" ]; then
-        err "Pas de glob.1 dans : $BASE_DIR"
-        err "  Avez-vous lance le calcul precedent avec --save-base ?"
-        err "  Contenu :"
-        ls -la "$BASE_DIR/" 2>/dev/null | while IFS= read -r l; do err "    $l"; done
+    [ -d "$BASE_DIR" ] || { err "-B doit etre un dossier : $BASE_DIR"; exit 1; }
+    [ -f "$BASE_DIR/glob.1" ] || {
+        err "Pas de glob.1 dans $BASE_DIR"
+        err "Contenu :"; ls "$BASE_DIR/" 2>/dev/null | while read -r l; do err "  $l"; done
+        err "Avez-vous utilise --save-base sur le calcul precedent ?"
         exit 1
-    fi
-    $QUIET || ok "Base POURSUITE : $BASE_DIR"
-    # Compter les fichiers base
-    shopt -s nullglob
-    BASE_FILES=("$BASE_DIR"/glob.* "$BASE_DIR"/pick.* "$BASE_DIR"/vola.*)
-    shopt -u nullglob
-    $QUIET || info "  ${#BASE_FILES[@]} fichier(s) base : $(ls "$BASE_DIR"/glob.* "$BASE_DIR"/pick.* "$BASE_DIR"/vola.* 2>/dev/null | xargs -n1 basename | tr '\n' ' ')"
+    }
+    $QUIET || ok "Base : $BASE_DIR"
 fi
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PREPARATION DU SCRATCH
-# ══════════════════════════════════════════════════════════════════════════════
-$QUIET || section "Preparation du scratch"
+# --- Scratch ---
+$QUIET || info "=== Scratch ==="
+SCRATCH="${SCRATCH_BASE}/${USER}/${STUDY_NAME}_$(date +%s)_$$"
+mkdir -p "$SCRATCH"
+$QUIET || ok "Scratch : $SCRATCH"
 
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)_$$"
-SCRATCH_DIR="${SCRATCH_BASE}/${USER}/${STUDY_NAME}_${TIMESTAMP}"
-mkdir -p "$SCRATCH_DIR" || { err "Impossible de creer : $SCRATCH_DIR"; exit 1; }
-$QUIET || info "Scratch : $SCRATCH_DIR"
+# Copie des fichiers
+cp "$COMM" "$SCRATCH/"
+[ -n "$MED" ]  && cp "$MED" "$SCRATCH/"
+[ -n "$MAIL" ] && cp "$MAIL" "$SCRATCH/"
 
-_copy_to_scratch() {
-    local src="$1"
-    rsync -a "$src" "$SCRATCH_DIR/" || { err "Echec copie : $src"; exit 1; }
-    $QUIET || ok "Copie : $(basename "$src")"
-}
-
-_copy_to_scratch "$COMM_FILE"
-[ -n "$MED_FILE"  ] && _copy_to_scratch "$MED_FILE"
-[ -n "$MAIL_FILE" ] && _copy_to_scratch "$MAIL_FILE"
-
-# Copier tous les fichiers base (glob.*, pick.*, vola.*) dans le scratch
-# Ils doivent etre a la racine du scratch, pas dans un sous-dossier
+# Base de poursuite : copier dans un sous-dossier base_in/
+# run_aster copie le dossier puis deplace son contenu a la racine
+# de son repertoire de travail interne (cf. run_aster/run.py copy_datafiles)
 if [ -n "$BASE_DIR" ]; then
-    $QUIET || info "Copie des fichiers base dans le scratch..."
-    shopt -s nullglob
-    for f in "$BASE_DIR"/glob.* "$BASE_DIR"/pick.* "$BASE_DIR"/vola.*; do
-        _copy_to_scratch "$f"
-    done
-    shopt -u nullglob
+    mkdir -p "${SCRATCH}/base_in"
+    cp "$BASE_DIR"/glob.* "${SCRATCH}/base_in/" 2>/dev/null || true
+    cp "$BASE_DIR"/pick.* "${SCRATCH}/base_in/" 2>/dev/null || true
+    cp "$BASE_DIR"/vola.* "${SCRATCH}/base_in/" 2>/dev/null || true
+    $QUIET || ok "Base copiee dans scratch/base_in/ ($(ls "${SCRATCH}/base_in/" | wc -l) fichiers)"
 fi
 
 # Fichiers annexes
 shopt -s nullglob
-for ext in py dat para include mfront; do
-    for f in "$STUDY_DIR/"*."$ext"; do _copy_to_scratch "$f"; done
+for f in "$STUDY_DIR"/*.py "$STUDY_DIR"/*.dat "$STUDY_DIR"/*.para \
+         "$STUDY_DIR"/*.include "$STUDY_DIR"/*.mfront; do
+    cp "$f" "$SCRATCH/"
 done
 shopt -u nullglob
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MEMOIRE & TEMPS
-# ══════════════════════════════════════════════════════════════════════════════
+# --- Memoire ---
 MEM_MB=$(echo "$MEM" | awk '
-    tolower($0) ~ /^[0-9]+(\.[0-9]+)?g$/ { gsub(/[gGiI]/, ""); print int($0 * 1024); next }
-    tolower($0) ~ /^[0-9]+(\.[0-9]+)?m$/ { gsub(/[mMiI]/, ""); print int($0);        next }
-    /^[0-9]+$/                            { print int($0);                             next }
-    { print -1 }
-')
-if [ "$MEM_MB" -le 0 ] 2>/dev/null; then
-    err "Format memoire non reconnu : '$MEM'"; exit 1
-fi
+    tolower($0) ~ /g$/ { gsub(/[gGiI]/,""); print int($0*1024); next }
+    tolower($0) ~ /m$/ { gsub(/[mMiI]/,""); print int($0);      next }
+    /^[0-9]+$/          { print int($0); next }
+    { print -1 }')
+[ "$MEM_MB" -le 0 ] 2>/dev/null && { err "Memoire invalide : $MEM"; exit 1; }
 ASTER_MEM=$(( MEM_MB - 512 ))
 [ "$ASTER_MEM" -lt 512 ] && ASTER_MEM=512
 
-TIME_LIMIT_SEC=$(echo "$TIME_LIMIT" | awk -F'[-:]' '
-    NF==4 {print $1*86400 + $2*3600 + $3*60 + $4; next}
-    NF==3 {print $1*3600  + $2*60   + $3;         next}
-    NF==2 {print $1*60    + $2;                   next}
-           {print $1*60}')
+# --- Temps ---
+TIME_SEC=$(echo "$TIME_LIMIT" | awk -F'[-:]' '
+    NF==4 {print $1*86400+$2*3600+$3*60+$4; next}
+    NF==3 {print $1*3600+$2*60+$3; next}
+    NF==2 {print $1*60+$2; next}
+    {print $1*60}')
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  GENERATION DU FICHIER .EXPORT
-# ══════════════════════════════════════════════════════════════════════════════
-$QUIET || section "Generation du fichier .export"
-
-COMM_BASENAME="$(basename "$COMM_FILE")"
-MED_BASENAME="$([ -n "$MED_FILE"  ] && basename "$MED_FILE"  || echo "")"
-MAIL_BASENAME="$([ -n "$MAIL_FILE" ] && basename "$MAIL_FILE" || echo "")"
-
-EXPORT_FILE="${SCRATCH_DIR}/${STUDY_NAME}.export"
+# --- .export ---
+$QUIET || info "=== Export ==="
+EXPORT="${SCRATCH}/${STUDY_NAME}.export"
 {
-    echo "P actions make_etude"
-    echo "P mode interactif"
-    echo "P version stable"
-    echo "P ncpus ${NTASKS}"
-    echo "P memory_limit ${ASTER_MEM}"
-    echo "P time_limit ${TIME_LIMIT_SEC}"
-    echo ""
+    echo "P time_limit $TIME_SEC"
+    echo "P memory_limit $ASTER_MEM"
+    echo "P ncpus $NTASKS"
 
-    # Fichiers d'entree
-    echo "F comm ${SCRATCH_DIR}/${COMM_BASENAME}           D  1"
-    [ -n "$MED_BASENAME"  ] && echo "F mmed ${SCRATCH_DIR}/${MED_BASENAME}            D 20"
-    [ -n "$MAIL_BASENAME" ] && echo "F mail ${SCRATCH_DIR}/${MAIL_BASENAME}           D 20"
+    # Entrees
+    echo "F comm ${SCRATCH}/$(basename "$COMM") D 1"
+    [ -n "$MED" ]  && echo "F mmed ${SCRATCH}/$(basename "$MED") D 20"
+    [ -n "$MAIL" ] && echo "F mail ${SCRATCH}/$(basename "$MAIL") D 20"
 
-    # Base en ENTREE pour POURSUITE (-B)
-    # Les fichiers glob.*, pick.*, vola.* sont a la racine du scratch
-    [ -n "$BASE_DIR" ] && echo "F base ${SCRATCH_DIR}/glob.1 D 0"
+    # Base en entree : dossier contenant glob/pick/vola
+    [ -n "$BASE_DIR" ] && echo "F base ${SCRATCH}/base_in D 0"
 
-    # Base en SORTIE (--save-base)
-    # Code_Aster ecrit glob.*, pick.*, vola.* dans le scratch
-    [ "$OPT_SAVE_BASE" = "1" ] && echo "F base ${SCRATCH_DIR}/glob.1 R 0"
+    # Base en sortie
+    [ "$SAVE_BASE" = "1" ] && echo "F base ${SCRATCH}/base_out R 0"
 
-    # Fichiers de sortie par defaut
-    echo "F mess ${SCRATCH_DIR}/${STUDY_NAME}.mess         R  6"
-    echo "F resu ${SCRATCH_DIR}/${STUDY_NAME}.resu         R  8"
-    echo "F rmed ${SCRATCH_DIR}/${STUDY_NAME}_resu.med     R 80"
+    # Sorties standard
+    echo "F mess ${SCRATCH}/${STUDY_NAME}.mess R 6"
+    echo "F resu ${SCRATCH}/${STUDY_NAME}.resu R 8"
+    echo "F rmed ${SCRATCH}/${STUDY_NAME}_resu.med R 80"
 
-    # Resultats supplementaires (-R)
-    if [ -n "$RESULT_UNITS" ]; then
-        IFS=',' read -ra RU_LIST <<< "$RESULT_UNITS"
-        for ru in "${RU_LIST[@]}"; do
-            R_TYPE="${ru%%:*}"
-            R_UNIT="${ru##*:}"
-            case "$R_TYPE" in
-                rmed)  R_EXT="med"   ;; resu)  R_EXT="resu"  ;;
-                mess)  R_EXT="mess"  ;; csv)   R_EXT="csv"   ;;
-                table) R_EXT="table" ;; dat)   R_EXT="dat"   ;;
-                pos)   R_EXT="pos"   ;; *)     R_EXT="$R_TYPE" ;;
+    # Sorties supplementaires
+    if [ -n "$RESULTS" ]; then
+        IFS=',' read -ra ITEMS <<< "$RESULTS"
+        for item in "${ITEMS[@]}"; do
+            TYPE="${item%%:*}"; UNIT="${item##*:}"
+            case "$TYPE" in
+                rmed) EXT="med" ;; resu) EXT="resu" ;; mess) EXT="mess" ;;
+                csv) EXT="csv" ;; table) EXT="table" ;; dat) EXT="dat" ;;
+                pos) EXT="pos" ;; *) EXT="$TYPE" ;;
             esac
-            echo "F ${R_TYPE} ${SCRATCH_DIR}/${STUDY_NAME}_u${R_UNIT}.${R_EXT}  R ${R_UNIT}"
+            echo "F ${TYPE} ${SCRATCH}/${STUDY_NAME}_u${UNIT}.${EXT} R ${UNIT}"
         done
     fi
 
-    # Repertoire de sortie
-    echo "R ${SCRATCH_DIR}/REPE_OUT R 0"
+    echo "R ${SCRATCH}/REPE_OUT R 0"
 
-} > "$EXPORT_FILE" || { err "Echec ecriture .export"; exit 1; }
+} > "$EXPORT"
 
 if ! $QUIET; then
-    ok "Export : $EXPORT_FILE"
-    while IFS= read -r line; do info "  $line"; done < "$EXPORT_FILE"
+    ok "Export : $EXPORT"
+    while IFS= read -r line; do info "  $line"; done < "$EXPORT"
 fi
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  AFFICHAGE RESSOURCES
-# ══════════════════════════════════════════════════════════════════════════════
+# --- Affichage ---
 if ! $QUIET; then
-    section "Ressources Slurm"
-    info "Partition  : $PARTITION"
-    info "Noeuds     : $NODES"
-    info "Taches MPI : $NTASKS"
-    info "CPUs/tache : $CPUS"
-    info "Memoire    : $MEM  (${ASTER_MEM} MB pour Code_Aster)"
-    info "Duree max  : $TIME_LIMIT"
-    info "Scratch    : $SCRATCH_DIR"
-    [ "$OPT_SAVE_BASE" = "1" ]    && info "Save base  : OUI (glob.*/pick.*/vola.* -> run_JOBID/base/)"
-    [ "$OPT_KEEP_SCRATCH" = "1" ] && info "Scratch    : conserve (--keep-scratch)"
-    [ "$OPT_DEBUG" = "1" ]        && info "Debug      : set -x actif"
-    [ -n "$RESULT_UNITS" ]        && info "Resultats+ : $RESULT_UNITS"
-    [ -n "$BASE_DIR" ]            && info "Base       : $BASE_DIR (POURSUITE)"
+    info "=== Ressources ==="
+    info "Partition : $PARTITION | Noeuds : $NODES | Taches : $NTASKS | CPUs : $CPUS"
+    info "Memoire   : $MEM (${ASTER_MEM}MB pour Aster) | Duree : $TIME_LIMIT"
+    [ "$SAVE_BASE" = "1" ]    && info "Save base : oui -> run_JOBID/base/"
+    [ -n "$BASE_DIR" ]        && info "Base in   : $BASE_DIR"
+    [ "$KEEP_SCRATCH" = "1" ] && info "Scratch   : conserve"
 fi
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SOUMISSION SLURM
-# ══════════════════════════════════════════════════════════════════════════════
-$QUIET || section "Soumission Slurm"
+# --- Soumission ---
+$QUIET || info "=== Soumission ==="
 
-SELF_SCRIPT="$(realpath "$0")"
-SLURM_LOG_OUT="${STUDY_DIR}/aster_%j.out"
-SLURM_LOG_ERR="${STUDY_DIR}/aster_%j.err"
+SELF="$(realpath "$0")"
 
-EXPORT_VARS="ALL"
-EXPORT_VARS+=",__ASTER_PHASE=RUN"
-EXPORT_VARS+=",__ASTER_STUDY_DIR=${STUDY_DIR}"
-EXPORT_VARS+=",__ASTER_STUDY_NAME=${STUDY_NAME}"
-EXPORT_VARS+=",__ASTER_SCRATCH_DIR=${SCRATCH_DIR}"
-EXPORT_VARS+=",__ASTER_EXPORT_FILE=${EXPORT_FILE}"
-EXPORT_VARS+=",__ASTER_MEM=${MEM}"
-EXPORT_VARS+=",__ASTER_ROOT=${ASTER_ROOT}"
-EXPORT_VARS+=",__ASTER_MODULE=${ASTER_MODULE}"
-EXPORT_VARS+=",__ASTER_KEEP_SCRATCH=${OPT_KEEP_SCRATCH}"
-EXPORT_VARS+=",__ASTER_DEBUG=${OPT_DEBUG}"
-EXPORT_VARS+=",__ASTER_SAVE_BASE=${OPT_SAVE_BASE}"
-EXPORT_VARS+=",__ASTER_BASE_DIR=${BASE_DIR}"
+VARS="ALL"
+VARS+=",__RUN_PHASE=EXEC"
+VARS+=",__STUDY_DIR=${STUDY_DIR}"
+VARS+=",__STUDY_NAME=${STUDY_NAME}"
+VARS+=",__SCRATCH=${SCRATCH}"
+VARS+=",__EXPORT=${EXPORT}"
+VARS+=",__ASTER_ROOT=${ASTER_ROOT}"
+VARS+=",__MODULE=${ASTER_MODULE}"
+VARS+=",__KEEP_SCRATCH=${KEEP_SCRATCH}"
+VARS+=",__DEBUG=${DEBUG}"
+VARS+=",__SAVE_BASE=${SAVE_BASE}"
+VARS+=",__BASE_DIR=${BASE_DIR}"
 
-SBATCH_CMD=(
-    sbatch --parsable
+CMD=(sbatch --parsable
     --job-name="aster_${STUDY_NAME}"
-    --partition="${PARTITION}"
-    --nodes="${NODES}"
-    --ntasks="${NTASKS}"
-    --cpus-per-task="${CPUS}"
-    --mem="${MEM}"
-    --time="${TIME_LIMIT}"
-    --output="${SLURM_LOG_OUT}"
-    --error="${SLURM_LOG_ERR}"
-    --export="${EXPORT_VARS}"
-    "$SELF_SCRIPT"
+    --partition="$PARTITION"
+    --nodes="$NODES"
+    --ntasks="$NTASKS"
+    --cpus-per-task="$CPUS"
+    --mem="$MEM"
+    --time="$TIME_LIMIT"
+    --output="${STUDY_DIR}/aster_%j.out"
+    --error="${STUDY_DIR}/aster_%j.err"
+    --export="$VARS"
+    "$SELF"
 )
 
-if [ "$OPT_DRY_RUN" = "1" ]; then
-    section "DRY RUN -- commande sbatch (non lancee)"
-    echo "  ${SBATCH_CMD[*]}"
-    echo ""
-    info "Export :"
-    echo "$EXPORT_VARS" | tr ',' '\n' | while IFS= read -r v; do info "  $v"; done
+if [ "$DRY_RUN" = "1" ]; then
+    info "DRY RUN :"
+    echo "  ${CMD[*]}"
     exit 0
 fi
 
-JOB_ID=$("${SBATCH_CMD[@]}") || { err "Echec sbatch"; exit 1; }
-[ -z "$JOB_ID" ] && { err "Job ID vide"; exit 1; }
+JOB=$("${CMD[@]}") || { err "sbatch a echoue"; exit 1; }
+[ -z "$JOB" ] && { err "Job ID vide"; exit 1; }
 
 if $QUIET; then
-    echo "$JOB_ID"
+    echo "$JOB"
 else
-    ok "Job soumis : ${BOLD}${JOB_ID}${NC}"
+    ok "Job $JOB soumis"
     echo ""
-    echo -e "  ${BOLD}Commandes utiles :${NC}"
-    echo -e "  squeue -j ${JOB_ID}"
-    echo -e "  tail -f ${STUDY_DIR}/aster_${JOB_ID}.out"
-    echo -e "  scancel ${JOB_ID}"
-    echo -e "  ls ${STUDY_DIR}/run_${JOB_ID}/"
-    echo -e "  ls -l ${STUDY_DIR}/latest"
-    [ -n "$BASE_DIR" ]            && echo -e "  # POURSUITE depuis : ${BASE_DIR}"
-    [ "$OPT_SAVE_BASE" = "1" ]    && echo -e "  # Base sauvegardee dans : run_${JOB_ID}/base/"
+    echo "  squeue -j $JOB"
+    echo "  tail -f ${STUDY_DIR}/aster_${JOB}.out"
+    echo "  scancel $JOB"
+    echo "  ls ${STUDY_DIR}/run_${JOB}/"
+    [ "$SAVE_BASE" = "1" ] && echo "  ls ${STUDY_DIR}/run_${JOB}/base/   # base pour -B"
     echo ""
 fi
