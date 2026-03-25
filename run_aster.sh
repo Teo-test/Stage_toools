@@ -35,6 +35,10 @@ ASTER_MODULE="${ASTER_MODULE:-code_aster}"
 # Répertoire scratch partagé (accessible depuis login ET nœuds de calcul)
 SCRATCH_BASE="${SCRATCH_BASE:-/scratch}"
 
+# Type MPI pour srun (vérifier avec : srun --mpi=list)
+# Valeurs courantes : pmi2, pmix, cray_shasta, none
+MPI_TYPE="${MPI_TYPE:-cray_shasta}"
+
 # ── Valeurs par défaut Slurm ─────────────────────────────────────────────────
 DEFAULT_PARTITION="court"
 DEFAULT_NODES=1
@@ -321,17 +325,18 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
     # On désactive set -e pour capturer proprement le code retour d'Aster.
     # Avec set -e, certains cas (pipes, sous-shells) peuvent provoquer
     # un arrêt prématuré avant que le code retour ne soit capturé.
+    #
+    # Sur Cray, srun est TOUJOURS nécessaire, même en séquentiel,
+    # pour initialiser correctement l'environnement réseau.
     ASTER_RC=0
     set +e
     if [ "${SLURM_NTASKS:-1}" -gt 1 ]; then
-        log "Mode parallèle MPI ($SLURM_NTASKS processus)"
-        srun --mpi=pmi2 "$ASTER_EXE" "$__ASTER_EXPORT_FILE"
-        ASTER_RC=$?
+        log "Mode parallèle MPI ($SLURM_NTASKS processus, mpi=${__ASTER_MPI_TYPE})"
     else
-        log "Mode séquentiel"
-        "$ASTER_EXE" "$__ASTER_EXPORT_FILE"
-        ASTER_RC=$?
+        log "Mode séquentiel (via srun, mpi=${__ASTER_MPI_TYPE})"
     fi
+    srun --mpi="${__ASTER_MPI_TYPE}" "$ASTER_EXE" "$__ASTER_EXPORT_FILE"
+    ASTER_RC=$?
     set -e
     log "Exécution terminée : $(date) — code retour : $ASTER_RC"
 
@@ -711,7 +716,10 @@ SELF_SCRIPT="$(realpath "$0")"
 SLURM_LOG_OUT="${STUDY_DIR}/aster_%j.out"
 SLURM_LOG_ERR="${STUDY_DIR}/aster_%j.err"
 
-# Variables exportées : uniquement ce dont la Phase 2 a besoin
+# Variables exportées : variables __ASTER_* + environnement système essentiel.
+# Sur Cray/HPC, les nœuds de calcul ont un PATH minimal — il faut
+# transmettre PATH, LD_LIBRARY_PATH, etc. pour que les commandes de base
+# (grep, date, tee, rsync...) et les bibliothèques soient accessibles.
 EXPORT_VARS="__ASTER_PHASE=RUN"
 EXPORT_VARS+=",__ASTER_STUDY_DIR=${STUDY_DIR}"
 EXPORT_VARS+=",__ASTER_STUDY_NAME=${STUDY_NAME}"
@@ -722,6 +730,15 @@ EXPORT_VARS+=",__ASTER_ROOT=${ASTER_ROOT}"
 EXPORT_VARS+=",__ASTER_MODULE=${ASTER_MODULE}"
 EXPORT_VARS+=",__ASTER_KEEP_SCRATCH=${OPT_KEEP_SCRATCH}"
 EXPORT_VARS+=",__ASTER_DEBUG=${OPT_DEBUG}"
+EXPORT_VARS+=",__ASTER_MPI_TYPE=${MPI_TYPE}"
+# Environnement système indispensable sur les nœuds de calcul
+EXPORT_VARS+=",PATH=${PATH}"
+EXPORT_VARS+=",HOME=${HOME}"
+EXPORT_VARS+=",USER=${USER}"
+EXPORT_VARS+=",SHELL=${SHELL:-/bin/bash}"
+[ -n "${LD_LIBRARY_PATH:-}" ] && EXPORT_VARS+=",LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+[ -n "${PYTHONPATH:-}"      ] && EXPORT_VARS+=",PYTHONPATH=${PYTHONPATH}"
+[ -n "${MODULEPATH:-}"      ] && EXPORT_VARS+=",MODULEPATH=${MODULEPATH}"
 
 # Construction de la commande sbatch
 SBATCH_CMD=(
