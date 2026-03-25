@@ -15,10 +15,11 @@
 #    PHASE 2 (nœud de calcul) : le script détecte __ASTER_PHASE=RUN
 #      (transmis via --export), charge Code_Aster et lance le calcul.
 #      À la fin (ou en cas de scancel/timeout), un trap rapatrie
-#      les résultats vers le dossier d'étude d'origine.
+#      les résultats vers le dossier d'étude d'origine et supprime
+#      automatiquement le scratch.
 #
 #  Auteur   : Téo LEROY
-#  Version  : 6.0
+#  Version  : 7.0
 #===============================================================================
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -73,6 +74,7 @@ USAGE
   Lance un calcul Code_Aster via Slurm.
   Les fichiers sont copiés dans ${SCRATCH_BASE}/\$USER/ avant soumission.
   Par défaut, DOSSIER_ETUDE = répertoire courant.
+  Le scratch est automatiquement supprimé après rapatriement des résultats.
 
 FICHIERS
   -C, --comm FILE      Fichier .comm  (auto-détecté si absent)
@@ -109,7 +111,9 @@ PRÉRÉGLAGES
 
 OPTIONS
   -q, --quiet          Sortie minimale (juste le job ID)
-      --clean          Supprimer le scratch après rapatriement des résultats
+      --keep-scratch   NE PAS supprimer le scratch après rapatriement
+                       (par défaut le scratch est toujours supprimé)
+      --dry-run        Afficher la commande sbatch sans la lancer
       --debug          Activer le mode debug bash (set -x) en phase d'exécution
   -h, --help           Afficher cette aide
 
@@ -124,8 +128,9 @@ EXEMPLES
   bash run_aster.sh -p debug -T 01:00:00         # Partition debug, 1h max
   bash run_aster.sh -C mon_calcul.comm -M maillage.med
   bash run_aster.sh -P moyen --results "rmed:81,csv:38"
-  bash run_aster.sh -P long --clean              # Supprimer scratch en fin de job
+  bash run_aster.sh -P long --keep-scratch       # Garder le scratch
   bash run_aster.sh --debug -P court             # Mode debug verbose
+  bash run_aster.sh --dry-run -P moyen           # Voir la commande sans lancer
 EOF
     exit 0
 }
@@ -144,7 +149,7 @@ EOF
 if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
 
     # ── Sécurité Bash en phase d'exécution ────────────────────────────────────
-    set -euo pipefail
+    set -uo pipefail
 
     # ── Mode debug : active la trace bash si demandé ──────────────────────────
     [ "${__ASTER_DEBUG:-0}" = "1" ] && set -x
@@ -153,7 +158,7 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
     __RAPATRIE_DONE=0
 
     # ── Fonction utilitaire : rapatrier un fichier via rsync ─────────────────
-    #  Usage : _rsync_result SRC DEST_DIR COUNTER_VAR
+    #  Usage : _rsync_result SRC DEST_DIR
     _rsync_result() {
         local src="$1" dest="$2"
         if rsync -av "$src" "$dest/" > >(while read -r l; do log "$l"; done) 2>&1; then
@@ -193,7 +198,6 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
         log "Destination : $dest"
 
         # Rapatrier TOUS les fichiers de résultat par extension
-        # nullglob : évite d'itérer sur un pattern littéral si aucun fichier ne correspond
         shopt -s nullglob
         for ext in mess resu med csv table dat pos rmed txt vtu vtk py; do
             for f in "${__ASTER_SCRATCH_DIR}"/*."${ext}"; do
@@ -212,7 +216,7 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
         if [ "$n" -eq 0 ]; then
             log "⚠ Aucun fichier résultat trouvé dans ${__ASTER_SCRATCH_DIR}"
             log "  Contenu du scratch :"
-            ls -la "${__ASTER_SCRATCH_DIR}/" 2>/dev/null | while IFS= read -r l; do log "   $l"; done
+            ls -la "${__ASTER_SCRATCH_DIR}/" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
         else
             log "✓ $n fichier(s) rapatrié(s) vers $dest"
         fi
@@ -225,8 +229,15 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
         done
         shopt -u nullglob
 
-        # Nettoyage du scratch si --clean a été demandé
-        if [ "${__ASTER_CLEAN:-0}" = "1" ]; then
+        # ── Lien symbolique "latest" vers le dernier run ─────────────────────
+        local latest_link="${__ASTER_STUDY_DIR}/latest"
+        rm -f "$latest_link" 2>/dev/null
+        if ln -s "run_${SLURM_JOB_ID}" "$latest_link" 2>/dev/null; then
+            log "✓ Lien symbolique : latest → run_${SLURM_JOB_ID}"
+        fi
+
+        # ── Nettoyage automatique du scratch ─────────────────────────────────
+        if [ "${__ASTER_KEEP_SCRATCH:-0}" != "1" ]; then
             log ""
             log "Nettoyage du scratch : $__ASTER_SCRATCH_DIR"
             if rm -rf "$__ASTER_SCRATCH_DIR"; then
@@ -234,6 +245,9 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
             else
                 log "⚠ Échec suppression scratch (droits insuffisants ?)"
             fi
+        else
+            log ""
+            log "Scratch conservé (--keep-scratch) : $__ASTER_SCRATCH_DIR"
         fi
     }
 
@@ -249,24 +263,28 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
     log "Destination    : ${__ASTER_STUDY_DIR}/run_${SLURM_JOB_ID}"
     log "Nœuds alloués  : $SLURM_NODELIST"
     log "Tâches MPI     : $SLURM_NTASKS"
-    log "CPUs par tâche : $SLURM_CPUS_PER_TASK"
+    log "CPUs par tâche : ${SLURM_CPUS_PER_TASK:-1}"
     log "Mémoire        : $__ASTER_MEM"
-    log "Clean scratch  : ${__ASTER_CLEAN:-0}"
+    log "Keep scratch   : ${__ASTER_KEEP_SCRATCH:-0}"
 
     # ── Chargement de Code_Aster ──────────────────────────────────────────────
     sep "CHARGEMENT CODE_ASTER"
 
-    if command -v module &>/dev/null && [ -n "${ASTER_MODULE:-}" ]; then
-        module load "${ASTER_MODULE}" 2>/dev/null \
-            && log "Module '${ASTER_MODULE}' chargé." \
-            || log "Module '${ASTER_MODULE}' non disponible."
+    ASTER_LOADED=0
+    if command -v module &>/dev/null && [ -n "${__ASTER_MODULE:-}" ]; then
+        if module load "${__ASTER_MODULE}" 2>/dev/null; then
+            log "Module '${__ASTER_MODULE}' chargé."
+            ASTER_LOADED=1
+        else
+            warn "Module '${__ASTER_MODULE}' non disponible — recherche manuelle de l'exécutable."
+        fi
     fi
 
     # Recherche de l'exécutable Code_Aster dans les emplacements courants
     ASTER_EXE=""
     for candidate in \
-        "${ASTER_ROOT}/bin/run_aster" \
-        "${ASTER_ROOT}/bin/as_run" \
+        "${__ASTER_ROOT}/bin/run_aster" \
+        "${__ASTER_ROOT}/bin/as_run" \
         "$(command -v run_aster 2>/dev/null || true)" \
         "$(command -v as_run   2>/dev/null || true)"
     do
@@ -281,6 +299,13 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
     fi
     log "Exécutable : $ASTER_EXE"
 
+    # Vérification de cohérence : si le module a échoué mais qu'on a trouvé
+    # un binaire, avertir l'utilisateur
+    if [ "$ASTER_LOADED" -eq 0 ] && [ -n "${__ASTER_MODULE:-}" ]; then
+        warn "Le module n'a pas été chargé — le binaire trouvé pourrait ne pas"
+        warn "avoir le bon environnement (LD_LIBRARY_PATH, etc.)."
+    fi
+
     # Vérification de version : détecte un binaire absent ou incompatible
     ASTER_VERSION=$("$ASTER_EXE" --version 2>&1 | head -1) || true
     if [ -z "$ASTER_VERSION" ]; then
@@ -293,16 +318,21 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
     sep "CALCUL EN COURS"
     log "Démarrage : $(date)"
 
-    # set -e est actif : le script s'arrête si Code_Aster échoue ;
-    # on capture le code retour manuellement pour le diagnostic.
+    # On désactive set -e pour capturer proprement le code retour d'Aster.
+    # Avec set -e, certains cas (pipes, sous-shells) peuvent provoquer
+    # un arrêt prématuré avant que le code retour ne soit capturé.
     ASTER_RC=0
-    if [ "$SLURM_NTASKS" -gt 1 ]; then
+    set +e
+    if [ "${SLURM_NTASKS:-1}" -gt 1 ]; then
         log "Mode parallèle MPI ($SLURM_NTASKS processus)"
-        srun --mpi=pmi2 "$ASTER_EXE" "$__ASTER_EXPORT_FILE" || ASTER_RC=$?
+        srun --mpi=pmi2 "$ASTER_EXE" "$__ASTER_EXPORT_FILE"
+        ASTER_RC=$?
     else
         log "Mode séquentiel"
-        "$ASTER_EXE" "$__ASTER_EXPORT_FILE" || ASTER_RC=$?
+        "$ASTER_EXE" "$__ASTER_EXPORT_FILE"
+        ASTER_RC=$?
     fi
+    set -e
     log "Exécution terminée : $(date) — code retour : $ASTER_RC"
 
     # ── Diagnostic rapide du .mess ────────────────────────────────────────────
@@ -374,9 +404,6 @@ fi
 
 set -euo pipefail
 
-# nullglob global pour éviter les erreurs sur les boucles de fichiers
-shopt -s nullglob
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  PARSING DES ARGUMENTS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -393,28 +420,30 @@ MEM=""
 TIME_LIMIT=""
 QUIET=false
 RESULT_UNITS=""
-OPT_CLEAN=0      # --clean : supprimer scratch après rapatriement
-OPT_DEBUG=0      # --debug : activer set -x en phase d'exécution
+OPT_KEEP_SCRATCH=0   # --keep-scratch : ne PAS supprimer le scratch
+OPT_DRY_RUN=0        # --dry-run : afficher la commande sans lancer
+OPT_DEBUG=0           # --debug : activer set -x en phase d'exécution
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -C|--comm)       COMM_FILE="$2";    shift 2 ;;
-        -M|--med)        MED_FILE="$2";     shift 2 ;;
-        -A|--mail)       MAIL_FILE="$2";    shift 2 ;;
-        -R|--results)    RESULT_UNITS="$2"; shift 2 ;;
-        -P|--preset)     PRESET="$2";       shift 2 ;;
-        -p|--partition)  PARTITION="$2";    shift 2 ;;
-        -n|--nodes)      NODES="$2";        shift 2 ;;
-        -t|--ntasks)     NTASKS="$2";       shift 2 ;;
-        -c|--cpus)       CPUS="$2";         shift 2 ;;
-        -m|--mem)        MEM="$2";          shift 2 ;;
-        -T|--time)       TIME_LIMIT="$2";   shift 2 ;;
-        -q|--quiet)      QUIET=true;        shift ;;
-        --clean)         OPT_CLEAN=1;       shift ;;
-        --debug)         OPT_DEBUG=1;       shift ;;
-        -h|--help)       usage ;;
-        -*)              err "Option inconnue : $1"; echo ""; usage ;;
-        *)               STUDY_DIR="$1";    shift ;;
+        -C|--comm)          COMM_FILE="$2";    shift 2 ;;
+        -M|--med)           MED_FILE="$2";     shift 2 ;;
+        -A|--mail)          MAIL_FILE="$2";    shift 2 ;;
+        -R|--results)       RESULT_UNITS="$2"; shift 2 ;;
+        -P|--preset)        PRESET="$2";       shift 2 ;;
+        -p|--partition)     PARTITION="$2";    shift 2 ;;
+        -n|--nodes)         NODES="$2";        shift 2 ;;
+        -t|--ntasks)        NTASKS="$2";       shift 2 ;;
+        -c|--cpus)          CPUS="$2";         shift 2 ;;
+        -m|--mem)           MEM="$2";          shift 2 ;;
+        -T|--time)          TIME_LIMIT="$2";   shift 2 ;;
+        -q|--quiet)         QUIET=true;        shift ;;
+        --keep-scratch)     OPT_KEEP_SCRATCH=1; shift ;;
+        --dry-run)          OPT_DRY_RUN=1;     shift ;;
+        --debug)            OPT_DEBUG=1;       shift ;;
+        -h|--help)          usage ;;
+        -*)                 err "Option inconnue : $1"; echo ""; usage ;;
+        *)                  STUDY_DIR="$1";    shift ;;
     esac
 done
 
@@ -469,7 +498,9 @@ $QUIET || info "Étude    : $STUDY_NAME"
 
 # ── Fichier .comm ─────────────────────────────────────────────────────────────
 if [ -z "$COMM_FILE" ]; then
-    mapfile -t COMM_LIST < <(find "$STUDY_DIR" -maxdepth 1 -name "*.comm" | sort)
+    shopt -s nullglob
+    COMM_LIST=("$STUDY_DIR"/*.comm)
+    shopt -u nullglob
     case ${#COMM_LIST[@]} in
         0) err "Aucun fichier .comm dans $STUDY_DIR"; exit 1 ;;
         1) COMM_FILE="${COMM_LIST[0]}" ;;
@@ -484,7 +515,9 @@ $QUIET || ok "Commandes: $COMM_FILE"
 
 # ── Fichier .med (optionnel) ──────────────────────────────────────────────────
 if [ -z "$MED_FILE" ]; then
-    mapfile -t MED_LIST < <(find "$STUDY_DIR" -maxdepth 1 -name "*.med" | sort)
+    shopt -s nullglob
+    MED_LIST=("$STUDY_DIR"/*.med)
+    shopt -u nullglob
     case ${#MED_LIST[@]} in
         0) : ;;
         1) MED_FILE="${MED_LIST[0]}" ;;
@@ -498,7 +531,9 @@ fi
 
 # ── Fichier .mail (format ASTER natif, optionnel) ────────────────────────────
 if [ -z "$MAIL_FILE" ]; then
-    mapfile -t MAIL_LIST < <(find "$STUDY_DIR" -maxdepth 1 -name "*.mail" | sort)
+    shopt -s nullglob
+    MAIL_LIST=("$STUDY_DIR"/*.mail)
+    shopt -u nullglob
     case ${#MAIL_LIST[@]} in
         0) : ;;
         1) MAIL_FILE="${MAIL_LIST[0]}" ;;
@@ -518,7 +553,9 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 $QUIET || section "Préparation du scratch"
 
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# Timestamp + PID pour garantir l'unicité même si deux jobs sont lancés
+# dans la même seconde sur la même étude
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)_$$"
 SCRATCH_DIR="${SCRATCH_BASE}/${USER}/${STUDY_NAME}_${TIMESTAMP}"
 
 $QUIET || info "Création : $SCRATCH_DIR"
@@ -539,26 +576,27 @@ _copy_to_scratch "$COMM_FILE"
 [ -n "$MAIL_FILE" ] && _copy_to_scratch "$MAIL_FILE"
 
 # ── Fichiers annexes optionnels (.py, .dat, .para, .include, .mfront) ─────────
-# nullglob est actif : la boucle est silencieuse si aucun fichier ne correspond
+shopt -s nullglob
 for ext in py dat para include mfront; do
     for f in "$STUDY_DIR/"*."$ext"; do
         _copy_to_scratch "$f"
     done
 done
+shopt -u nullglob
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PARSING ROBUSTE DE LA MÉMOIRE
-#  Formats acceptés : 4G, 4g, 4096M, 4096m, 4096 (entier → supposé MB)
+#  Formats acceptés : 4G, 4g, 1.5G, 4096M, 4096m, 4096 (entier → supposé MB)
 # ══════════════════════════════════════════════════════════════════════════════
 MEM_MB=$(echo "$MEM" | awk '
-    tolower($0) ~ /^[0-9]+g$/ { gsub(/[gGiI]/, ""); print int($0) * 1024; next }
-    tolower($0) ~ /^[0-9]+m$/ { gsub(/[mMiI]/, ""); print int($0);        next }
-    /^[0-9]+$/                { print int($0);                             next }
+    tolower($0) ~ /^[0-9]+(\.[0-9]+)?g$/ { gsub(/[gGiI]/, ""); print int($0 * 1024); next }
+    tolower($0) ~ /^[0-9]+(\.[0-9]+)?m$/ { gsub(/[mMiI]/, ""); print int($0);        next }
+    /^[0-9]+$/                            { print int($0);                             next }
     { print -1 }
 ')
 
 if [ "$MEM_MB" -le 0 ] 2>/dev/null; then
-    err "Format mémoire non reconnu : '$MEM'  (attendu : 4G, 512M, ou entier en MB)"
+    err "Format mémoire non reconnu : '$MEM'  (attendu : 4G, 1.5G, 512M, ou entier en MB)"
     exit 1
 fi
 
@@ -603,11 +641,6 @@ EXPORT_FILE="${SCRATCH_DIR}/${STUDY_NAME}.export"
     echo "F rmed ${SCRATCH_DIR}/${STUDY_NAME}_resu.med     R 80"
 
     # ── Résultats supplémentaires (--results / -R) ──
-    #
-    #  Format : "type:unite,type:unite,..."
-    #  Types reconnus : rmed, resu, mess, csv, table, dat, pos
-    #  Exemple : --results "rmed:81,csv:38"
-    #
     if [ -n "$RESULT_UNITS" ]; then
         IFS=',' read -ra RU_LIST <<< "$RESULT_UNITS"
         for ru in "${RU_LIST[@]}"; do
@@ -650,7 +683,8 @@ if ! $QUIET; then
     info "Mémoire    : $MEM  (${ASTER_MEM} MB alloués à Code_Aster)"
     info "Durée max  : $TIME_LIMIT"
     info "Scratch    : $SCRATCH_DIR"
-    [ "$OPT_CLEAN" = "1" ] && info "Clean      : scratch supprimé après rapatriement"
+    [ "$OPT_KEEP_SCRATCH" = "1" ] && info "Scratch    : conservé après rapatriement (--keep-scratch)"
+    [ "$OPT_KEEP_SCRATCH" = "0" ] && info "Scratch    : supprimé automatiquement après rapatriement"
     [ "$OPT_DEBUG" = "1" ] && info "Debug      : set -x actif en phase d'exécution"
     [ -n "$RESULT_UNITS"  ] && info "Résultats+ : $RESULT_UNITS"
 fi
@@ -659,11 +693,9 @@ fi
 #  RE-SOUMISSION DE CE MÊME SCRIPT AVEC LES DIRECTIVES SLURM EN LIGNE
 # ══════════════════════════════════════════════════════════════════════════════
 #
-#  Astuce : on ne met PAS de #SBATCH dans le fichier. On passe TOUT en
-#  arguments de la commande sbatch. Ainsi :
-#    - La phase 1 (ce code-ci) tourne sur le login sans allocation
-#    - sbatch re-soumet CE MÊME script avec --partition, --time, etc.
-#    - La phase 2 (code ci-dessus) s'active grâce à __ASTER_PHASE=RUN
+#  On passe uniquement les variables __ASTER_* nécessaires au nœud de calcul
+#  au lieu de --export=ALL, pour éviter les conflits d'environnement
+#  (PATH, LD_LIBRARY_PATH, etc.) entre le nœud login et les nœuds de calcul.
 #
 #  LOGS : --output et --error pointent vers le dossier d'étude (work)
 #         pour être accessibles immédiatement avec tail -f, sans
@@ -679,18 +711,48 @@ SELF_SCRIPT="$(realpath "$0")"
 SLURM_LOG_OUT="${STUDY_DIR}/aster_%j.out"
 SLURM_LOG_ERR="${STUDY_DIR}/aster_%j.err"
 
-JOB_ID=$(sbatch --parsable \
-    --job-name="aster_${STUDY_NAME}" \
-    --partition="${PARTITION}" \
-    --nodes="${NODES}" \
-    --ntasks="${NTASKS}" \
-    --cpus-per-task="${CPUS}" \
-    --mem="${MEM}" \
-    --time="${TIME_LIMIT}" \
-    --output="${SLURM_LOG_OUT}" \
-    --error="${SLURM_LOG_ERR}" \
-    --export="ALL,__ASTER_PHASE=RUN,__ASTER_STUDY_DIR=${STUDY_DIR},__ASTER_STUDY_NAME=${STUDY_NAME},__ASTER_SCRATCH_DIR=${SCRATCH_DIR},__ASTER_EXPORT_FILE=${EXPORT_FILE},__ASTER_MEM=${MEM},__ASTER_CLEAN=${OPT_CLEAN},__ASTER_DEBUG=${OPT_DEBUG}" \
-    "$SELF_SCRIPT") || { err "Échec de la soumission Slurm (sbatch a retourné une erreur)."; exit 1; }
+# Variables exportées : uniquement ce dont la Phase 2 a besoin
+EXPORT_VARS="__ASTER_PHASE=RUN"
+EXPORT_VARS+=",__ASTER_STUDY_DIR=${STUDY_DIR}"
+EXPORT_VARS+=",__ASTER_STUDY_NAME=${STUDY_NAME}"
+EXPORT_VARS+=",__ASTER_SCRATCH_DIR=${SCRATCH_DIR}"
+EXPORT_VARS+=",__ASTER_EXPORT_FILE=${EXPORT_FILE}"
+EXPORT_VARS+=",__ASTER_MEM=${MEM}"
+EXPORT_VARS+=",__ASTER_ROOT=${ASTER_ROOT}"
+EXPORT_VARS+=",__ASTER_MODULE=${ASTER_MODULE}"
+EXPORT_VARS+=",__ASTER_KEEP_SCRATCH=${OPT_KEEP_SCRATCH}"
+EXPORT_VARS+=",__ASTER_DEBUG=${OPT_DEBUG}"
+
+# Construction de la commande sbatch
+SBATCH_CMD=(
+    sbatch --parsable
+    --job-name="aster_${STUDY_NAME}"
+    --partition="${PARTITION}"
+    --nodes="${NODES}"
+    --ntasks="${NTASKS}"
+    --cpus-per-task="${CPUS}"
+    --mem="${MEM}"
+    --time="${TIME_LIMIT}"
+    --output="${SLURM_LOG_OUT}"
+    --error="${SLURM_LOG_ERR}"
+    --export="${EXPORT_VARS}"
+    "$SELF_SCRIPT"
+)
+
+# ── Mode dry-run : afficher la commande sans lancer ───────────────────────────
+if [ "$OPT_DRY_RUN" = "1" ]; then
+    section "DRY RUN — commande sbatch (non lancée)"
+    echo ""
+    echo "  ${SBATCH_CMD[*]}"
+    echo ""
+    info "Export variables :"
+    echo "$EXPORT_VARS" | tr ',' '\n' | while IFS= read -r v; do info "  $v"; done
+    echo ""
+    info "Pour lancer réellement, retirez --dry-run"
+    exit 0
+fi
+
+JOB_ID=$("${SBATCH_CMD[@]}") || { err "Échec de la soumission Slurm (sbatch a retourné une erreur)."; exit 1; }
 
 if [ -z "$JOB_ID" ]; then
     err "Échec de la soumission Slurm (job ID vide)."
@@ -712,5 +774,6 @@ else
     echo -e "  scancel ${JOB_ID}                                      # annuler"
     echo -e "  ls ${SCRATCH_DIR}/                                    # scratch"
     echo -e "  ls ${STUDY_DIR}/run_${JOB_ID}/                        # résultats rapatriés"
+    echo -e "  ls -l ${STUDY_DIR}/latest                             # dernier run (symlink)"
     echo ""
 fi
