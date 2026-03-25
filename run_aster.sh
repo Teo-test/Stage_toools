@@ -11,7 +11,7 @@
 #    PHASE 2 (noeud de calcul) : chargement Aster, calcul, rapatriement
 #
 #  Auteur   : Teo LEROY
-#  Version  : 8.2
+#  Version  : 8.3
 #===============================================================================
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -68,21 +68,22 @@ FICHIERS
   -A, --mail FILE      Fichier .mail  (auto-detecte si absent)
 
 POURSUITE / ENCHAINEMENT
-  --save-base          Sauvegarder la base de donnees Aster en sortie.
-                       Produit un fichier STUDY_NAME.base dans les resultats.
+  --save-base          Sauvegarder la base Aster (glob.*, pick.*, vola.*)
+                       dans run_JOBID/base/ apres le calcul.
                        Indispensable si un calcul suivant utilise POURSUITE().
 
-  -B, --base FICHIER   Fichier .base d'un calcul precedent pour POURSUITE().
-                       Typiquement : ~/etude_thermo/latest/thermo.base
+  -B, --base DOSSIER   Dossier contenant la base d'un calcul precedent
+                       (glob.*, pick.*, vola.*) pour POURSUITE().
+                       Typiquement : ~/etude_thermo/latest/base
 
   Workflow couplage thermo-meca :
     1. bash run_aster.sh --save-base -P moyen ~/etude_thermo/
-    2. bash run_aster.sh -B ~/etude_thermo/latest/etude_thermo.base -P moyen ~/etude_meca/
+    2. bash run_aster.sh -B ~/etude_thermo/latest/base -P moyen ~/etude_meca/
 
   Enchainer 3 calculs :
     1. bash run_aster.sh --save-base ~/etape1/
-    2. bash run_aster.sh --save-base -B ~/etape1/latest/etape1.base ~/etape2/
-    3. bash run_aster.sh -B ~/etape2/latest/etape2.base ~/etape3/
+    2. bash run_aster.sh --save-base -B ~/etape1/latest/base ~/etape2/
+    3. bash run_aster.sh -B ~/etape2/latest/base ~/etape3/
 
 RESULTATS SUPPLEMENTAIRES
   -R, --results LIST   Unites additionnelles. Format : "type:unite,..."
@@ -150,7 +151,7 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
 
         # Rapatrier les fichiers de resultat par extension
         shopt -s nullglob
-        for ext in mess resu med csv table dat pos rmed txt vtu vtk py base; do
+        for ext in mess resu med csv table dat pos rmed txt vtu vtk py; do
             for f in "${__ASTER_SCRATCH_DIR}"/*."${ext}"; do
                 if [ -f "$f" ] && [ -s "$f" ]; then
                     _rsync_result "$f" "$dest" && (( n++ )) || true
@@ -164,11 +165,35 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
             _rsync_result "${__ASTER_SCRATCH_DIR}/REPE_OUT" "$dest" && (( n++ )) || true
         fi
 
+        # Rapatrier la base (glob.*, pick.*, vola.*) dans un sous-dossier base/
+        # Uniquement si --save-base a ete demande
+        if [ "${__ASTER_SAVE_BASE:-0}" = "1" ]; then
+            local base_dest="${dest}/base"
+            mkdir -p "$base_dest" 2>/dev/null
+            shopt -s nullglob
+            local base_count=0
+            for f in "${__ASTER_SCRATCH_DIR}"/glob.* \
+                     "${__ASTER_SCRATCH_DIR}"/pick.* \
+                     "${__ASTER_SCRATCH_DIR}"/vola.*; do
+                if [ -f "$f" ] && [ -s "$f" ]; then
+                    _rsync_result "$f" "$base_dest" && (( base_count++ )) || true
+                fi
+            done
+            shopt -u nullglob
+            if [ "$base_count" -gt 0 ]; then
+                log "OK $base_count fichier(s) base rapatrie(s) vers $base_dest"
+                (( n += base_count ))
+            else
+                log "!! Aucun fichier base (glob.*, pick.*, vola.*) trouve dans le scratch"
+                log "   Le calcul a peut-etre echoue avant de generer la base."
+            fi
+        fi
+
         if [ "$n" -eq 0 ]; then
             log "!! Aucun fichier resultat trouve"
             ls -la "${__ASTER_SCRATCH_DIR}/" 2>/dev/null | while IFS= read -r l; do log "   $l"; done
         else
-            log "OK $n fichier(s) rapatrie(s) vers $dest"
+            log "OK $n fichier(s) rapatrie(s) au total vers $dest"
         fi
 
         log ""
@@ -208,7 +233,7 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
     log "Taches MPI     : $SLURM_NTASKS"
     log "Memoire        : $__ASTER_MEM"
     log "Save base      : ${__ASTER_SAVE_BASE:-0}"
-    log "Base poursuite : ${__ASTER_BASE_FILE:-aucune}"
+    log "Base poursuite : ${__ASTER_BASE_DIR:-aucune}"
 
     # ── Chargement de Code_Aster ──────────────────────────────────────────────
     sep "CHARGEMENT CODE_ASTER"
@@ -245,6 +270,13 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
 
     ASTER_VERSION=$("$ASTER_EXE" --version 2>&1 | head -1) || true
     [ -n "$ASTER_VERSION" ] && log "Version : $ASTER_VERSION"
+
+    # ── Debug : contenu du scratch avant lancement ────────────────────────────
+    sep "CONTENU SCRATCH"
+    ls -la "$__ASTER_SCRATCH_DIR/" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
+    log ""
+    log "Contenu du .export :"
+    cat "$__ASTER_EXPORT_FILE" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
 
     # ── Lancement ─────────────────────────────────────────────────────────────
     sep "CALCUL EN COURS"
@@ -316,7 +348,7 @@ STUDY_DIR="."
 COMM_FILE=""
 MED_FILE=""
 MAIL_FILE=""
-BASE_FILE=""
+BASE_DIR=""
 PRESET=""
 PARTITION=""
 NODES=""
@@ -336,7 +368,7 @@ while [[ $# -gt 0 ]]; do
         -C|--comm)          COMM_FILE="$2";       shift 2 ;;
         -M|--med)           MED_FILE="$2";        shift 2 ;;
         -A|--mail)          MAIL_FILE="$2";       shift 2 ;;
-        -B|--base)          BASE_FILE="$2";       shift 2 ;;
+        -B|--base)          BASE_DIR="$2";        shift 2 ;;
         -R|--results)       RESULT_UNITS="$2";    shift 2 ;;
         -P|--preset)        PRESET="$2";          shift 2 ;;
         -p|--partition)     PARTITION="$2";       shift 2 ;;
@@ -433,15 +465,23 @@ fi
 
 [ -z "$MED_FILE" ] && [ -z "$MAIL_FILE" ] && warn "Aucun maillage detecte"
 
-# .base (poursuite)
-if [ -n "$BASE_FILE" ]; then
-    BASE_FILE="$(realpath "$BASE_FILE")"
-    if [ ! -f "$BASE_FILE" ]; then
-        err "Fichier base introuvable : $BASE_FILE"
+# Base de poursuite (-B dossier)
+if [ -n "$BASE_DIR" ]; then
+    BASE_DIR="$(realpath "$BASE_DIR")"
+    [ -d "$BASE_DIR" ] || { err "Dossier base introuvable : $BASE_DIR"; exit 1; }
+    if [ ! -f "$BASE_DIR/glob.1" ]; then
+        err "Pas de glob.1 dans : $BASE_DIR"
         err "  Avez-vous lance le calcul precedent avec --save-base ?"
+        err "  Contenu :"
+        ls -la "$BASE_DIR/" 2>/dev/null | while IFS= read -r l; do err "    $l"; done
         exit 1
     fi
-    $QUIET || ok "Base POURSUITE : $BASE_FILE"
+    $QUIET || ok "Base POURSUITE : $BASE_DIR"
+    # Compter les fichiers base
+    shopt -s nullglob
+    BASE_FILES=("$BASE_DIR"/glob.* "$BASE_DIR"/pick.* "$BASE_DIR"/vola.*)
+    shopt -u nullglob
+    $QUIET || info "  ${#BASE_FILES[@]} fichier(s) base : $(ls "$BASE_DIR"/glob.* "$BASE_DIR"/pick.* "$BASE_DIR"/vola.* 2>/dev/null | xargs -n1 basename | tr '\n' ' ')"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -464,12 +504,15 @@ _copy_to_scratch "$COMM_FILE"
 [ -n "$MED_FILE"  ] && _copy_to_scratch "$MED_FILE"
 [ -n "$MAIL_FILE" ] && _copy_to_scratch "$MAIL_FILE"
 
-# La base doit etre renommee en glob.1 dans le scratch :
-# Code_Aster (run_aster) cherche toujours ./glob.1 en interne,
-# quel que soit le nom du fichier .base d'origine.
-if [ -n "$BASE_FILE" ]; then
-    rsync -a "$BASE_FILE" "$SCRATCH_DIR/glob.1" || { err "Echec copie base : $BASE_FILE"; exit 1; }
-    $QUIET || ok "Copie : $(basename "$BASE_FILE") -> glob.1"
+# Copier tous les fichiers base (glob.*, pick.*, vola.*) dans le scratch
+# Ils doivent etre a la racine du scratch, pas dans un sous-dossier
+if [ -n "$BASE_DIR" ]; then
+    $QUIET || info "Copie des fichiers base dans le scratch..."
+    shopt -s nullglob
+    for f in "$BASE_DIR"/glob.* "$BASE_DIR"/pick.* "$BASE_DIR"/vola.*; do
+        _copy_to_scratch "$f"
+    done
+    shopt -u nullglob
 fi
 
 # Fichiers annexes
@@ -525,13 +568,12 @@ EXPORT_FILE="${SCRATCH_DIR}/${STUDY_NAME}.export"
     [ -n "$MAIL_BASENAME" ] && echo "F mail ${SCRATCH_DIR}/${MAIL_BASENAME}           D 20"
 
     # Base en ENTREE pour POURSUITE (-B)
-    # Le fichier .base a ete renomme en glob.1 dans le scratch
-    [ -n "$BASE_FILE" ] && echo "F base ${SCRATCH_DIR}/glob.1 D 0"
+    # Les fichiers glob.*, pick.*, vola.* sont a la racine du scratch
+    [ -n "$BASE_DIR" ] && echo "F base ${SCRATCH_DIR}/glob.1 D 0"
 
     # Base en SORTIE (--save-base)
-    if [ "$OPT_SAVE_BASE" = "1" ]; then
-        echo "F base ${SCRATCH_DIR}/${STUDY_NAME}.base R 0"
-    fi
+    # Code_Aster ecrit glob.*, pick.*, vola.* dans le scratch
+    [ "$OPT_SAVE_BASE" = "1" ] && echo "F base ${SCRATCH_DIR}/glob.1 R 0"
 
     # Fichiers de sortie par defaut
     echo "F mess ${SCRATCH_DIR}/${STUDY_NAME}.mess         R  6"
@@ -576,11 +618,11 @@ if ! $QUIET; then
     info "Memoire    : $MEM  (${ASTER_MEM} MB pour Code_Aster)"
     info "Duree max  : $TIME_LIMIT"
     info "Scratch    : $SCRATCH_DIR"
-    [ "$OPT_SAVE_BASE" = "1" ]    && info "Save base  : OUI (${STUDY_NAME}.base sera rapatrie)"
+    [ "$OPT_SAVE_BASE" = "1" ]    && info "Save base  : OUI (glob.*/pick.*/vola.* -> run_JOBID/base/)"
     [ "$OPT_KEEP_SCRATCH" = "1" ] && info "Scratch    : conserve (--keep-scratch)"
     [ "$OPT_DEBUG" = "1" ]        && info "Debug      : set -x actif"
     [ -n "$RESULT_UNITS" ]        && info "Resultats+ : $RESULT_UNITS"
-    [ -n "$BASE_FILE" ]           && info "Base       : $BASE_FILE (POURSUITE)"
+    [ -n "$BASE_DIR" ]            && info "Base       : $BASE_DIR (POURSUITE)"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -604,7 +646,7 @@ EXPORT_VARS+=",__ASTER_MODULE=${ASTER_MODULE}"
 EXPORT_VARS+=",__ASTER_KEEP_SCRATCH=${OPT_KEEP_SCRATCH}"
 EXPORT_VARS+=",__ASTER_DEBUG=${OPT_DEBUG}"
 EXPORT_VARS+=",__ASTER_SAVE_BASE=${OPT_SAVE_BASE}"
-EXPORT_VARS+=",__ASTER_BASE_FILE=${BASE_FILE}"
+EXPORT_VARS+=",__ASTER_BASE_DIR=${BASE_DIR}"
 
 SBATCH_CMD=(
     sbatch --parsable
@@ -644,7 +686,7 @@ else
     echo -e "  scancel ${JOB_ID}"
     echo -e "  ls ${STUDY_DIR}/run_${JOB_ID}/"
     echo -e "  ls -l ${STUDY_DIR}/latest"
-    [ -n "$BASE_FILE" ]           && echo -e "  # POURSUITE depuis : ${BASE_FILE}"
-    [ "$OPT_SAVE_BASE" = "1" ]    && echo -e "  # Base sauvegardee : run_${JOB_ID}/${STUDY_NAME}.base"
+    [ -n "$BASE_DIR" ]            && echo -e "  # POURSUITE depuis : ${BASE_DIR}"
+    [ "$OPT_SAVE_BASE" = "1" ]    && echo -e "  # Base sauvegardee dans : run_${JOB_ID}/base/"
     echo ""
 fi
