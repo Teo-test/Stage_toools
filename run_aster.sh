@@ -326,16 +326,16 @@ if [ "${__ASTER_PHASE:-}" = "RUN" ]; then
     # Avec set -e, certains cas (pipes, sous-shells) peuvent provoquer
     # un arrêt prématuré avant que le code retour ne soit capturé.
     #
-    # Sur Cray, srun est TOUJOURS nécessaire, même en séquentiel,
-    # pour initialiser correctement l'environnement réseau.
+    # IMPORTANT : run_aster / as_run sont eux-mêmes des lanceurs qui gèrent
+    # MPI en interne (via mpiexec). Les appeler via srun provoque un conflit
+    # de double pilotage MPI (erreur "Unreachable in file client.c").
+    # On les appelle donc DIRECTEMENT et c'est le .export (ncpus) qui
+    # détermine le mode séquentiel ou parallèle.
     ASTER_RC=0
     set +e
-    if [ "${SLURM_NTASKS:-1}" -gt 1 ]; then
-        log "Mode parallèle MPI ($SLURM_NTASKS processus, mpi=${__ASTER_MPI_TYPE})"
-    else
-        log "Mode séquentiel (via srun, mpi=${__ASTER_MPI_TYPE})"
-    fi
-    srun --mpi="${__ASTER_MPI_TYPE}" "$ASTER_EXE" "$__ASTER_EXPORT_FILE"
+    log "Lancement : $ASTER_EXE $__ASTER_EXPORT_FILE"
+    log "  (ncpus=${SLURM_NTASKS:-1} — le parallélisme est géré par run_aster via le .export)"
+    "$ASTER_EXE" "$__ASTER_EXPORT_FILE"
     ASTER_RC=$?
     set -e
     log "Exécution terminée : $(date) — code retour : $ASTER_RC"
