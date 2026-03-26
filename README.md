@@ -73,6 +73,8 @@ Par défaut : répertoire courant.
 | `-M, --med FILE`  | Maillage au format MED (auto-détecté si absent) |
 | `-A, --mail FILE` | Maillage au format ASTER natif (auto-détecté si absent) |
 
+
+
 Si plusieurs fichiers `.comm` ou `.med` sont trouvés dans le dossier, le premier par ordre alphabétique est sélectionné (avertissement affiché).
 
 Les fichiers annexes (`.py`, `.dat`, `.para`, `.include`, `.mfront`) présents dans le dossier d'étude sont copiés automatiquement dans le scratch.
@@ -105,25 +107,6 @@ Les options passées **après** `-P` remplacent les paramètres par défaut :
 ```bash
 bash run_aster.sh -P moyen -t 8   # préréglage moyen, mais 8 tâches MPI
 ```
-
-### Poursuite de calcul
-
-| Option | Description |
-|--------|-------------|
-| `--save-base`         | Sauvegarde la base (glob/pick/vola) après le calcul dans `run_JOBID/base/` |
-| `-B, --base DOSSIER`  | Dossier contenant les fichiers glob/pick/vola d'un calcul précédent (pour `POURSUITE`) |
-
-Exemple de workflow :
-
-```bash
-# Calcul initial — sauvegarder la base pour une poursuite ultérieure
-bash run_aster.sh --save-base ~/thermo/
-
-# Poursuite — reprendre depuis la base sauvegardée
-bash run_aster.sh -B ~/thermo/latest/base/ ~/meca/
-```
-
-> **Note :** `-B` attend un dossier contenant directement les fichiers `glob.*`, `pick.*`, `vola.*`.
 
 ### Résultats supplémentaires `-R`
 
@@ -194,10 +177,6 @@ bash run_aster.sh -C calcul.comm -M maillage.med
 # Résultats additionnels
 bash run_aster.sh -P moyen -R "rmed:81,csv:38" mon_etude/
 
-# Poursuite de calcul
-bash run_aster.sh --save-base mon_etude/
-bash run_aster.sh -B mon_etude/latest/base/ mon_etude_suite/
-
 # Récupérer juste l'ID (pour scripts)
 JOB=$(bash run_aster.sh -q mon_etude/)
 
@@ -214,9 +193,8 @@ bash run_aster.sh --dry-run -P moyen mon_etude/
 1. Détecte les fichiers `.comm`, `.med`, `.mail` dans le dossier d'étude
 2. Crée `$SCRATCH_BASE/$USER/<etude>_<timestamp>_<pid>/`
 3. Copie tous les fichiers d'entrée dans le scratch (y compris fichiers annexes)
-4. Copie la base de poursuite dans `scratch/base_in/` si `-B` est fourni
-5. Génère le fichier `.export` (configuration Code_Aster)
-6. Soumet le job via `sbatch` en passant toutes les options via `--export`
+4. Génère le fichier `.export` (configuration Code_Aster)
+5. Soumet le job via `sbatch` en passant toutes les options via `--export`
 
 ### Phase 2 — nœud de calcul
 
@@ -226,7 +204,6 @@ bash run_aster.sh --dry-run -P moyen mon_etude/
 4. Analyse le `.mess` : compte les alarmes `<A>`, erreurs fatales `<F>`, exceptions `<S>`, affiche les premières erreurs si présentes
 5. **Rapatrie** les fichiers de résultat du scratch vers `$STUDY_DIR/run_$JOBID/`
 6. Crée un lien symbolique `$STUDY_DIR/latest` → `run_$JOBID/`
-7. Sauvegarde la base (glob/pick/vola) dans `run_$JOBID/base/` si `--save-base`
 
 ### Gestion des interruptions (scancel / timeout)
 
@@ -244,9 +221,6 @@ $SCRATCH_BASE/$USER/<etude>_<timestamp>_<pid>/   ← scratch (calcul)
   ├─ mon_etude.mess
   ├─ mon_etude.resu
   ├─ mon_etude_resu.med
-  ├─ base_in/                ← copie de la base d'entrée (si -B)
-  │   ├─ glob.1
-  │   └─ ...
   └─ REPE_OUT/               ← répertoire de sortie libre (si utilisé)
 
 $STUDY_DIR/                                      ← dossier d'étude
@@ -257,10 +231,7 @@ $STUDY_DIR/                                      ← dossier d'étude
       ├─ mon_etude.mess
       ├─ mon_etude.resu
       ├─ mon_etude_resu.med
-      ├─ REPE_OUT/           ← si présent dans le scratch
-      └─ base/               ← base sauvegardée (si --save-base)
-          ├─ glob.1
-          └─ ...
+      └─ REPE_OUT/           ← si présent dans le scratch
 ```
 
 ---

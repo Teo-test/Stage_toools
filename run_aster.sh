@@ -24,19 +24,6 @@
 #      · Rapatrie les resultats vers le dossier d'etude
 #      · Nettoie le scratch
 #
-#  GESTION DE LA BASE (POURSUITE / CHAINAGE)
-#  ─────────────────────────────────────────
-#  La "base" est la base de donnees interne de Code_Aster (fichiers glob.*,
-#  pick.*, vola.*). Elle contient l'etat complet du calcul et est necessaire
-#  pour reprendre un calcul (POURSUITE) ou pour chainage thermomecanique.
-#
-#    --save-base : demande a run_aster d'ecrire la base en sortie dans
-#                 scratch/base_out/, puis la rapatrie dans run_JOBID/base/.
-#    -B DOSSIER  : declare "F base DOSSIER D 0" dans le .export — run_aster
-#                 lit le dossier directement (pas de copie dans le scratch).
-#    -E FICHIER  : declare "F rmed FICHIER D 80" — permet de lire un champ
-#                 (ex: temperature) depuis un calcul precedent via LIRE_CHAMP.
-#
 #  NOTE MPI : run_aster/as_run lance lui-meme les processus MPI en interne.
 #  Ne pas l'encapsuler dans srun, cela provoquerait une double initialisation
 #  MPI et des conflits de gestionnaires de processus.
@@ -117,18 +104,6 @@ FICHIERS
   -M, --med  FILE       Fichier .med  (auto-detecte si absent)
   -A, --mail FILE       Fichier .mail (auto-detecte si absent)
 
-POURSUITE / CHAINAGE
-  --save-base           Sauvegarder la base (glob/pick/vola) apres le calcul
-  -B, --base DOSSIER    Dossier .base d'un calcul precedent (POURSUITE)
-                        -> F base DOSSIER D 0 dans le .export
-  -E, --ext-rmed FILE   Fichier .rmed en entree (ex: champ de temperature)
-                        -> F rmed FILE D 80 dans le .export
-
-  Exemples :
-    bash run_aster.sh --save-base ~/thermo/
-    bash run_aster.sh -B ~/thermo/latest/base/ ~/meca/
-    bash run_aster.sh -E ~/thermo/latest/thermo_resu.rmed ~/meca/
-
 RESULTATS SUPPLEMENTAIRES
   -R, --results LIST    Format "type:unite,..." (ex: "rmed:81, csv:38")
 
@@ -203,7 +178,6 @@ if [ "${__RUN_PHASE:-}" = "EXEC" ]; then
     #
     # Structure du dossier de destination :
     #   $STUDY_DIR/run_$JOBID/          <- resultats du calcul
-    #   $STUDY_DIR/run_$JOBID/base/     <- base sauvegardee (si --save-base)
     #   $STUDY_DIR/latest -> run_$JOBID <- lien symbolique vers le dernier run
     # ─────────────────────────────────────────────────────────────────
     collect_results() {
@@ -244,37 +218,6 @@ if [ "${__RUN_PHASE:-}" = "EXEC" ]; then
             (( count++ ))
         fi 2>/dev/null
 
-        # --- Base de calcul (glob/pick/vola) si --save-base ---
-        # run_aster ecrit la base dans scratch/base_out/ (declare via
-        # "F base scratch/base_out R 0" dans le .export).
-        # On la copie dans run_JOBID/base/ pour pouvoir la fournir avec -B
-        # lors d'un calcul de POURSUITE ulterieur.
-        if [ "${__SAVE_BASE:-0}" = "1" ]; then
-            local base_dest="${dest}/base"
-            mkdir -p "$base_dest"
-            local bc=0   # compteur de fichiers base
-            for f in "${__SCRATCH}/base_out"/glob.* \
-                     "${__SCRATCH}/base_out"/pick.* \
-                     "${__SCRATCH}/base_out"/vola.*; do
-                if [ -f "$f" ] && [ -s "$f" ]; then
-                    _cp "$f" "$base_dest/"
-                    log "  -> base/$(basename "$f")"
-                    (( bc++ ))
-                fi
-            done 2>/dev/null
-            if [ "$bc" -gt 0 ]; then
-                log "$bc fichier(s) base sauves dans $base_dest"
-                (( count += bc ))
-            else
-                # Diagnostic si la base est attendue mais absente
-                log "!! Aucun fichier base trouve (glob/pick/vola)"
-                log "   Contenu scratch/ :"
-                ls -la "${__SCRATCH}/" 2>/dev/null
-                log "   Contenu base_out/ :"
-                ls -la "${__SCRATCH}/base_out/" 2>/dev/null
-            fi
-        fi
-
         # --- Lien symbolique "latest" ---
         # Pointe toujours vers le dossier du dernier job termine,
         # pour acceder facilement aux resultats sans connaitre le JOBID :
@@ -310,9 +253,6 @@ if [ "${__RUN_PHASE:-}" = "EXEC" ]; then
     log "Job       : $SLURM_JOB_ID"
     log "Noeud     : $SLURM_NODELIST"
     log "Scratch   : $__SCRATCH"
-    log "Save base : ${__SAVE_BASE:-0}"
-    log "Base in   : ${__BASE_DIR:-aucune}"
-    log "Ext rmed  : ${__EXT_RMED:-aucun}"
 
     # ─────────────────────────────────────────────────────────────────
     # Chargement du module Code_Aster
@@ -376,7 +316,6 @@ if [ "${__RUN_PHASE:-}" = "EXEC" ]; then
     header "VERIFICATION"
     log "Contenu scratch :"
     ls -la "$__SCRATCH/" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
-    # Note : il n'y a plus de base_in/ (la base est lue via son chemin direct)
     log ""
     log "Contenu .export :"
     # "while IFS= read -r l" preserve les espaces en debut de ligne et les
@@ -471,9 +410,9 @@ set -euo pipefail
 # defaut pour eviter les erreurs "variable non definie" avec set -u.
 # ─────────────────────────────────────────────────────────────────
 STUDY_DIR="."
-COMM="" ; MED="" ; MAIL="" ; BASE_DIR="" ; EXT_RMED=""
+COMM="" ; MED="" ; MAIL=""
 PRESET="" ; PARTITION="" ; NODES="" ; NTASKS="" ; CPUS="" ; MEM="" ; TIME_LIMIT=""
-QUIET=false ; RESULTS="" ; KEEP_SCRATCH=0 ; DRY_RUN=0 ; DEBUG=0 ; SAVE_BASE=0
+QUIET=false ; RESULTS="" ; KEEP_SCRATCH=0 ; DRY_RUN=0 ; DEBUG=0
 
 # ─────────────────────────────────────────────────────────────────
 # Parsing des arguments en ligne de commande
@@ -488,8 +427,6 @@ while [ $# -gt 0 ]; do
         -C|--comm)      COMM="$2";        shift 2 ;;   # Fichier .comm explicite
         -M|--med)       MED="$2";         shift 2 ;;   # Maillage MED explicite
         -A|--mail)      MAIL="$2";        shift 2 ;;   # Maillage ASTER natif explicite
-        -B|--base)      BASE_DIR="$2";    shift 2 ;;   # Dossier base pour POURSUITE
-        -E|--ext-rmed)  EXT_RMED="$2";   shift 2 ;;   # Fichier .rmed en entree (chainage)
         -R|--results)   RESULTS="$2";     shift 2 ;;   # Sorties supplementaires "type:unite,..."
         -P|--preset)    PRESET="$2";      shift 2 ;;   # Preset (court/moyen/long)
         -p|--partition) PARTITION="$2";   shift 2 ;;   # Partition Slurm
@@ -499,7 +436,6 @@ while [ $# -gt 0 ]; do
         -m|--mem)       MEM="$2";         shift 2 ;;   # Memoire (ex: 8G)
         -T|--time)      TIME_LIMIT="$2";  shift 2 ;;   # Duree max
         -q|--quiet)     QUIET=true;       shift ;;     # Mode silencieux (affiche seulement le JOB ID)
-        --save-base)    SAVE_BASE=1;      shift ;;     # Sauvegarder la base apres le calcul
         --keep-scratch) KEEP_SCRATCH=1;   shift ;;     # Ne pas supprimer le scratch
         --dry-run)      DRY_RUN=1;        shift ;;     # Afficher la commande sans la lancer
         --debug)        DEBUG=1;          shift ;;     # Activer set -x en Phase 2
@@ -575,45 +511,6 @@ fi
 [ -n "$MAIL" ] && { MAIL="$(realpath "$MAIL")"; $QUIET || ok "Mail : $MAIL"; }
 
 # ─────────────────────────────────────────────────────────────────
-# Validation de la base de poursuite (-B)
-#
-# La base est un dossier contenant les fichiers internes de Code_Aster :
-#   glob.N  : donnees globales du modele
-#   pick.N  : donnees de reprise (checkpoint)
-#   vola.N  : donnees volatiles (resultats intermediaires)
-# ou N est un indice numerique (glob.1, glob.2, ...).
-#
-# On verifie la presence de glob.1 comme indicateur de base valide.
-# Le chemin est utilise directement dans le .export (pas de copie),
-# car run_aster le lit en mode lecture seule ("D 0" = Direction entree).
-# ─────────────────────────────────────────────────────────────────
-if [ -n "$BASE_DIR" ]; then
-    BASE_DIR="$(realpath "$BASE_DIR")"
-    [ -d "$BASE_DIR" ] || { err "-B doit etre un dossier : $BASE_DIR"; exit 1; }
-    [ -f "$BASE_DIR/glob.1" ] || {
-        err "Pas de glob.1 dans $BASE_DIR"
-        err "Contenu :"; ls "$BASE_DIR/" 2>/dev/null | while read -r l; do err "  $l"; done
-        err "Avez-vous utilise --save-base sur le calcul precedent ?"
-        exit 1
-    }
-    $QUIET || ok "Base    : $BASE_DIR"
-fi
-
-# ─────────────────────────────────────────────────────────────────
-# Validation du fichier .rmed externe (-E)
-#
-# Utilise pour le chainage : lit un champ (temperature, deplacement...)
-# depuis un calcul precedent via LIRE_CHAMP dans le .comm.
-# Declare en unite 80 (meme unite que la sortie rmed, mais direction D
-# vs R — Code_Aster distingue les deux dans le format .export).
-# ─────────────────────────────────────────────────────────────────
-if [ -n "$EXT_RMED" ]; then
-    EXT_RMED="$(realpath "$EXT_RMED")"
-    [ -f "$EXT_RMED" ] || { err "-E : fichier introuvable : $EXT_RMED"; exit 1; }
-    $QUIET || ok "Ext rmed : $EXT_RMED"
-fi
-
-# ─────────────────────────────────────────────────────────────────
 # Creation du dossier scratch
 #
 # Le scratch est un filesystem local ou NFS haute performance partage
@@ -633,15 +530,6 @@ $QUIET || ok "Scratch : $SCRATCH"
 cp "$COMM" "$SCRATCH/"
 [ -n "$MED" ]  && cp "$MED" "$SCRATCH/"
 [ -n "$MAIL" ] && cp "$MAIL" "$SCRATCH/"
-
-# La base de poursuite (-B) n'est PAS copiee dans le scratch.
-# Son chemin original est declare directement dans le .export.
-# run_aster s'occupe lui-meme de la copier dans son repertoire interne.
-
-# Si --save-base : cree le dossier de sortie pour la base.
-# run_aster ecrira les fichiers glob/pick/vola dans ce dossier.
-# Il doit exister avant le lancement du calcul.
-[ "$SAVE_BASE" = "1" ] && mkdir -p "${SCRATCH}/base_out"
 
 # Fichiers annexes : copies automatiquement si presents dans le dossier d'etude.
 # Utiles pour les calculs qui font appel a des modules Python (.py),
@@ -721,22 +609,6 @@ EXPORT="${SCRATCH}/${STUDY_NAME}.export"
     [ -n "$MED" ]  && echo "F mmed ${SCRATCH}/$(basename "$MED") D 20"    # Unite 20 : maillage MED
     [ -n "$MAIL" ] && echo "F mail ${SCRATCH}/$(basename "$MAIL") D 20"   # Unite 20 : maillage ASTER
 
-    # Base en entree pour POURSUITE : chemin direct vers le dossier .base.
-    # "D 0" = unite 0, direction entree. run_aster copie le dossier dans
-    # son repertoire de travail interne lors de l'initialisation.
-    [ -n "$BASE_DIR" ] && echo "F base ${BASE_DIR} D 0"
-
-    # Fichier .rmed externe pour chainage (ex: champ de temperature).
-    # Unite 80, direction entree. Dans le .comm, on utilise LIRE_CHAMP
-    # avec UNITE=80 pour lire le champ depuis ce fichier.
-    # Note : la sortie rmed standard est aussi sur l'unite 80 (direction R) ;
-    # les deux coexistent car D et R sont distingues dans le format .export.
-    [ -n "$EXT_RMED" ] && echo "F rmed ${EXT_RMED} D 80"
-
-    # Base en sortie : run_aster ecrit les fichiers glob/pick/vola dans
-    # ce dossier. collect_results les rapatriera dans run_JOBID/base/.
-    [ "$SAVE_BASE" = "1" ] && echo "F base ${SCRATCH}/base_out R 0"
-
     # Fichiers de sortie standard
     echo "F mess ${SCRATCH}/${STUDY_NAME}.mess R 6"              # Unite 6 : messages (log Aster)
     echo "F resu ${SCRATCH}/${STUDY_NAME}.resu R 8"              # Unite 8 : resultats texte
@@ -782,9 +654,6 @@ if ! $QUIET; then
     section "Ressources Slurm"
     info "Partition : $PARTITION | Noeuds : $NODES | Taches : $NTASKS | CPUs : $CPUS"
     info "Memoire   : $MEM (${ASTER_MEM}MB pour Aster) | Duree : $TIME_LIMIT"
-    [ "$SAVE_BASE" = "1" ]    && info "Save base : oui -> run_JOBID/base/"
-    [ -n "$BASE_DIR" ]        && info "Base in   : $BASE_DIR"
-    [ -n "$EXT_RMED" ]        && info "Ext rmed  : $EXT_RMED"
     [ "$KEEP_SCRATCH" = "1" ] && info "Scratch   : conserve"
 fi
 
@@ -818,10 +687,6 @@ VARS+=",__ASTER_ROOT=${ASTER_ROOT}"   # Racine Code_Aster pour trouver l'executa
 VARS+=",__MODULE=${ASTER_MODULE}"     # Nom du module a charger (peut etre vide)
 VARS+=",__KEEP_SCRATCH=${KEEP_SCRATCH}"  # 1 = ne pas supprimer le scratch
 VARS+=",__DEBUG=${DEBUG}"             # 1 = activer set -x en Phase 2
-VARS+=",__SAVE_BASE=${SAVE_BASE}"     # 1 = sauvegarder la base apres le calcul
-VARS+=",__BASE_DIR=${BASE_DIR}"       # Chemin de la base en entree (peut etre vide)
-VARS+=",__EXT_RMED=${EXT_RMED}"       # Chemin du .rmed externe (peut etre vide)
-
 # Construction de la commande sbatch sous forme de tableau bash.
 # Un tableau evite les problemes de quoting avec les espaces dans les chemins.
 CMD=(sbatch --parsable
@@ -860,6 +725,5 @@ else
     echo "  tail -f ${STUDY_DIR}/aster_${JOB}.out"                # Logs temps reel
     echo "  scancel $JOB"                                          # Annuler
     echo "  ls ${STUDY_DIR}/run_${JOB}/"                          # Resultats rapatries
-    [ "$SAVE_BASE" = "1" ] && echo "  ls ${STUDY_DIR}/run_${JOB}/base/   # base pour -B"
     echo ""
 fi
