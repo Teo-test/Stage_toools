@@ -55,8 +55,8 @@ DEFAULT_TIME="05:00:00"
 # Chaque preset definit partition, ntasks, memoire et duree maximale.
 # Les valeurs peuvent etre surchargees apres -P (ex: -P moyen -t 8).
 PRESET_COURT_PARTITION="court"  ; PRESET_COURT_NTASKS=4  ; PRESET_COURT_MEM="2G"  ; PRESET_COURT_TIME="05:00:00"
-PRESET_MOYEN_PARTITION="moyen"  ; PRESET_MOYEN_NTASKS=4  ; PRESET_MOYEN_MEM="8G"  ; PRESET_MOYEN_TIME="03-00:00:00"
-PRESET_LONG_PARTITION="long"    ; PRESET_LONG_NTASKS=4   ; PRESET_LONG_MEM="32G"  ; PRESET_LONG_TIME="30-00:00:00"
+PRESET_MOYEN_PARTITION="moyen"  ; PRESET_MOYEN_NTASKS=4  ; PRESET_MOYEN_MEM="20G"  ; PRESET_MOYEN_TIME="03-00:00:00"
+PRESET_LONG_PARTITION="long"    ; PRESET_LONG_NTASKS=4   ; PRESET_LONG_MEM="50G"  ; PRESET_LONG_TIME="30-00:00:00"
 
 # ══════════════════════════════════════════
 #  FONCTIONS D'AFFICHAGE
@@ -118,6 +118,11 @@ RESSOURCES SLURM
 
 OPTIONS
   -q, --quiet           Sortie minimale
+  -f, --follow          Suivre le job apres soumission :
+                          · Spinner avec l'etat Slurm (PENDING/CONFIGURING)
+                          · tail -f automatique des le passage en RUNNING
+                          · Bilan (alarmes/erreurs) a la fin du job
+                          · Ctrl+C detache sans annuler le calcul
       --keep-scratch    Ne pas supprimer le scratch
       --dry-run         Afficher sans lancer
       --debug           Mode verbose (set -x)
@@ -412,7 +417,7 @@ set -euo pipefail
 STUDY_DIR="."
 COMM="" ; MED="" ; MAIL=""
 PRESET="" ; PARTITION="" ; NODES="" ; NTASKS="" ; CPUS="" ; MEM="" ; TIME_LIMIT=""
-QUIET=false ; RESULTS="" ; KEEP_SCRATCH=0 ; DRY_RUN=0 ; DEBUG=0
+QUIET=false ; RESULTS="" ; KEEP_SCRATCH=0 ; DRY_RUN=0 ; DEBUG=0 ; FOLLOW=0
 
 # ─────────────────────────────────────────────────────────────────
 # Parsing des arguments en ligne de commande
@@ -436,6 +441,7 @@ while [ $# -gt 0 ]; do
         -m|--mem)       MEM="$2";         shift 2 ;;   # Memoire (ex: 8G)
         -T|--time)      TIME_LIMIT="$2";  shift 2 ;;   # Duree max
         -q|--quiet)     QUIET=true;       shift ;;     # Mode silencieux (affiche seulement le JOB ID)
+        -f|--follow)    FOLLOW=1;         shift ;;     # Suivre le job apres soumission
         --keep-scratch) KEEP_SCRATCH=1;   shift ;;     # Ne pas supprimer le scratch
         --dry-run)      DRY_RUN=1;        shift ;;     # Afficher la commande sans la lancer
         --debug)        DEBUG=1;          shift ;;     # Activer set -x en Phase 2
@@ -658,6 +664,93 @@ if ! $QUIET; then
 fi
 
 # ─────────────────────────────────────────────────────────────────
+# _follow_job : suit un job Slurm apres soumission
+#
+#   1. Affiche l'etat (PENDING/CONFIGURING/...) avec un spinner jusqu'au
+#      passage en RUNNING.
+#   2. Des que RUNNING, enchaine automatiquement sur tail -f du log.
+#   3. A la fin du job, affiche un bilan (alarmes / erreurs fatales).
+#   Ctrl+C pendant le tail detache proprement sans annuler le calcul.
+# ─────────────────────────────────────────────────────────────────
+_follow_job() {
+    local job="$1" logfile="$2"
+    local state="" si=0
+    local -a SP=('|' '/' '-' '\')
+
+    # ── Attente du passage en RUNNING ────────────────────────────
+    echo ""
+    while true; do
+        state=$(squeue -j "$job" -h -o "%T" 2>/dev/null || true)
+        if [ -z "$state" ]; then
+            # Job deja termine (tres court ou erreur immediate)
+            break
+        fi
+        if [ "$state" = "RUNNING" ]; then
+            printf "\r  %-70s\n" "Etat : RUNNING"
+            break
+        fi
+        printf "\r  %s  %-12s  %s" \
+            "${SP[$si]}" "$state" "(Ctrl+C pour detacher)"
+        si=$(( (si+1) % 4 ))
+        sleep 3
+    done
+
+    # ── Tail live si le job est en cours ─────────────────────────
+    if [ "$state" = "RUNNING" ]; then
+        info "Logs en temps reel — Ctrl+C pour detacher sans annuler :"
+        echo ""
+        # Attendre l'apparition du fichier log (max 30 s)
+        local t=0
+        while ! [ -f "$logfile" ] && [ "$t" -lt 30 ]; do
+            sleep 1; (( t++ ))
+        done
+        [ -f "$logfile" ] || warn "Fichier log introuvable : $logfile"
+
+        tail -f "$logfile" &
+        local TAIL_PID=$!
+
+        # Ctrl+C : detacher sans tuer le job
+        # shellcheck disable=SC2064
+        trap "kill $TAIL_PID 2>/dev/null; echo ''; \
+              info 'Detache — job $job toujours en cours'; \
+              info 'Relancer avec : tail -f $logfile'; exit 0" INT
+
+        # Polling jusqu'a la fin du job (toutes les 5 s)
+        while squeue -j "$job" -h &>/dev/null; do sleep 5; done
+
+        sleep 2   # laisser tail vider le buffer restant
+        kill $TAIL_PID 2>/dev/null
+        wait $TAIL_PID 2>/dev/null
+        trap - INT
+    fi
+
+    # ── Bilan final ───────────────────────────────────────────────
+    local dest="${STUDY_DIR}/run_${job}"
+    echo ""
+    section "BILAN JOB $job"
+    if [ -d "$dest" ]; then
+        local mess na=0 nf=0 ns=0
+        mess=$(ls "${dest}"/*.mess 2>/dev/null | head -1 || true)
+        if [ -n "$mess" ]; then
+            na=$(grep -c "<A>" "$mess" 2>/dev/null || true)
+            nf=$(grep -c "<F>" "$mess" 2>/dev/null || true)
+            ns=$(grep -c "<S>" "$mess" 2>/dev/null || true)
+            if [ "$nf" -eq 0 ] && [ "$ns" -eq 0 ]; then
+                ok "Calcul termine — $na alarme(s)"
+            else
+                err "Calcul en echec — <F>:$nf  <S>:$ns  <A>:$na"
+                # Affiche les premieres erreurs fatales
+                [ "$nf" -gt 0 ] && grep -B2 -A5 "<F>" "$mess" | head -20
+            fi
+        fi
+        ok "Resultats : $dest"
+        ls "$dest/" 2>/dev/null | while read -r f; do info "  $f"; done
+    else
+        warn "Dossier de resultats absent : $dest"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────
 # Soumission via sbatch
 #
 # sbatch est la commande de soumission de Slurm.
@@ -721,9 +814,10 @@ if $QUIET; then
 else
     ok "Job $JOB soumis"
     echo ""
-    echo "  squeue -j $JOB"                                        # Etat du job
-    echo "  tail -f ${STUDY_DIR}/aster_${JOB}.out"                # Logs temps reel
-    echo "  scancel $JOB"                                          # Annuler
-    echo "  ls ${STUDY_DIR}/run_${JOB}/"                          # Resultats rapatries
+    echo "  squeue -j $JOB"
+    echo "  tail -f ${STUDY_DIR}/aster_${JOB}.out"
+    echo "  scancel $JOB"
+    echo "  ls ${STUDY_DIR}/run_${JOB}/"
     echo ""
+    [ "$FOLLOW" = "1" ] && _follow_job "$JOB" "${STUDY_DIR}/aster_${JOB}.out"
 fi

@@ -147,6 +147,7 @@ IMPR_TABLE(UNITE=38, ...)    # avec -R "csv:38"
 | Option | Description |
 |--------|-------------|
 | `-q, --quiet`     | Sortie minimale — affiche uniquement le job ID |
+| `-f, --follow`    | Suit le job après soumission : spinner PENDING → `tail -f` automatique en RUNNING → bilan final. Ctrl+C détache sans annuler le calcul. |
 | `--keep-scratch`  | Conserver le dossier scratch après le calcul |
 | `--dry-run`       | Afficher la commande sbatch sans la lancer |
 | `--debug`         | Mode verbose (`set -x`) sur le nœud de calcul |
@@ -176,6 +177,10 @@ bash run_aster.sh -C calcul.comm -M maillage.med
 
 # Résultats additionnels
 bash run_aster.sh -P moyen -R "rmed:81,csv:38" mon_etude/
+
+# Suivre le job en temps réel
+bash run_aster.sh -f mon_etude/
+bash run_aster.sh -P moyen -f mon_etude/
 
 # Récupérer juste l'ID (pour scripts)
 JOB=$(bash run_aster.sh -q mon_etude/)
