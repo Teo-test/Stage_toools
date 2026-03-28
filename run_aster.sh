@@ -198,30 +198,43 @@ if [ "${__RUN_PHASE:-}" = "EXEC" ]; then
 
         local count=0   # compteur de fichiers rapatries (informatif)
 
+        # --- Debug : lister tout ce qu'il y a dans le scratch ---
+        log "Fichiers presents dans le scratch :"
+        ls -la "${__SCRATCH}/" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
+        log ""
+
         # --- Resultats classiques ---
         # On parcourt toutes les extensions de fichiers que Code_Aster peut produire.
-        # [ -f "$f" ] : verifie que c'est un fichier regulier (pas un dossier)
-        # [ -s "$f" ] : verifie que le fichier n'est pas vide (taille > 0)
-        # Les globs sans correspondance retournent la chaine litterale sous bash ;
-        # le test -f filtre ces cas (le fichier n'existe pas).
-        for ext in mess resu med csv table dat pos rmed txt vtu vtk py; do
+        # nullglob : si aucun fichier ne correspond au glob, la boucle est vide
+        # (au lieu d'iterer sur la chaine litterale du glob).
+        shopt -s nullglob
+        for ext in mess resu med csv table dat pos rmed txt vtu vtk py base; do
             for f in "${__SCRATCH}"/*."${ext}"; do
                 if [ -f "$f" ] && [ -s "$f" ]; then
-                    _cp "$f" "$dest/"
-                    log "  -> $(basename "$f")"
-                    (( count++ ))
+                    _cp "$f" "$dest/" && log "  -> $(basename "$f")" || log "  !! ECHEC copie : $(basename "$f")"
+                    count=$((count + 1))
                 fi
             done
-        done 2>/dev/null
+        done
+        shopt -u nullglob
+
+        # --- Fichiers glob/pick/vola (base Code_Aster) ---
+        shopt -s nullglob
+        for f in "${__SCRATCH}"/glob.* "${__SCRATCH}"/pick.* "${__SCRATCH}"/vola.*; do
+            if [ -f "$f" ] && [ -s "$f" ]; then
+                _cp "$f" "$dest/" && log "  -> $(basename "$f")" || log "  !! ECHEC copie : $(basename "$f")"
+                count=$((count + 1))
+            fi
+        done
+        shopt -u nullglob
 
         # --- Repertoire REPE_OUT ---
         # Code_Aster peut ecrire dans REPE_OUT via des commandes comme IMPR_RESU
         # avec un repertoire de sortie libre. On le rapatrie entierement si present.
         if [ -d "${__SCRATCH}/REPE_OUT" ]; then
-            _cp "${__SCRATCH}/REPE_OUT" "$dest/"
-            log "  -> REPE_OUT/"
-            (( count++ ))
-        fi 2>/dev/null
+            _cp "${__SCRATCH}/REPE_OUT" "$dest/" && log "  -> REPE_OUT/" || log "  !! ECHEC copie REPE_OUT"
+            count=$((count + 1))
+        fi
 
         # --- Lien symbolique "latest" ---
         # Pointe toujours vers le dossier du dernier job termine,
@@ -230,7 +243,12 @@ if [ "${__RUN_PHASE:-}" = "EXEC" ]; then
         rm -f "${__STUDY_DIR}/latest" 2>/dev/null
         ln -s "run_${SLURM_JOB_ID}" "${__STUDY_DIR}/latest" 2>/dev/null
 
+        log ""
         log "$count fichier(s) rapatrie(s) -> $dest"
+
+        # --- Contenu final du dossier destination ---
+        log "Contenu de $dest :"
+        ls -la "$dest/" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
 
         # --- Nettoyage du scratch ---
         # Sauf si --keep-scratch a ete demande (utile pour deboguer un calcul
