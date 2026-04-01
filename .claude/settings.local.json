@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(grep -E '\\\\.\\(py|txt|md|yml|yaml|cfg|ini|toml\\)$')"
-    ]
-  }
-}
