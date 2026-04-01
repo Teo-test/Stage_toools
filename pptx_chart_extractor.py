@@ -541,4 +541,139 @@ def _finaliser(fig, g, sauvegarder, dossier_out):
     if sauvegarder:
         dossier = Path(dossier_out)
         dossier.mkdir(parents=True, exist_ok=True)
-        nom  
+        nom    = f"graphe_{g['idx']:02d}_{slugify(g['titre'])}.png"
+        chemin = dossier / nom
+        fig.savefig(chemin, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        ok(f"Image sauvegardée : {C.BOLD}{chemin}{C.RESET}")
+    else:
+        plt.show()
+
+# ─── Menus ────────────────────────────────────────────────────────────────────
+
+def choisir_graphes(graphes, message="Quels graphes ?"):
+    labels = [f"[Slide {g['slide']}] {g['famille']:<8} — {g['titre']}" for g in graphes]
+    idxs   = menu_numerote(message, labels + ["Tous"], allow_multiple=True)
+    if len(graphes) in idxs:
+        return list(range(len(graphes)))
+    return idxs
+
+def menu_plot(graphes, dossier_out):
+    selection = choisir_graphes(graphes, "Afficher quels graphes ?")
+    mode_idx  = menu_numerote("Mode d'affichage",
+                              ["Afficher à l'écran", "Sauvegarder en PNG", "Les deux"])
+    for idx in selection:
+        g = graphes[idx]
+        info(f"Graphe {g['idx']} : {g['titre']}  ({g['tag_xml']})")
+        if g["df"].empty:
+            warn("  Données vides — plot ignoré.")
+            continue
+        if mode_idx == 0:
+            plot_graphe(g, sauvegarder=False)
+        elif mode_idx == 1:
+            plot_graphe(g, sauvegarder=True, dossier_out=dossier_out)
+        else:
+            plot_graphe(g, sauvegarder=True, dossier_out=dossier_out)
+            plot_graphe(g, sauvegarder=False)
+
+def menu_exporter(graphes, dossier_out):
+    selection = choisir_graphes(graphes, "Exporter quels graphes en CSV ?")
+    exporter_csv(graphes, selection, dossier_out)
+
+def menu_tout_exporter(graphes, dossier_out):
+    titre("EXPORT COMPLET (CSV + PNG)")
+    non_vides = [i for i, g in enumerate(graphes) if not g["df"].empty]
+    if not non_vides:
+        warn("Aucun graphe avec des données à exporter.")
+        return
+    info(f"{len(non_vides)} graphe(s) → {C.BOLD}{dossier_out}/{C.RESET}")
+    exporter_csv(graphes, non_vides, dossier_out)
+    for idx in non_vides:
+        plot_graphe(graphes[idx], sauvegarder=True, dossier_out=dossier_out)
+    ok(f"Export terminé dans {C.BOLD}{dossier_out}/{C.RESET}")
+
+# ─── Menu principal ───────────────────────────────────────────────────────────
+
+MENU_PRINCIPAL = [
+    "Afficher / sauvegarder des graphes",
+    "Exporter des graphes en CSV",
+    "Export complet (tous CSV + PNG)",
+    "Voir le détail d'un graphe",
+    "Résumé des graphes",
+    "Charger un autre fichier PPTX",
+    "Quitter",
+]
+
+def charger_pptx(chemin):
+    p = Path(chemin)
+    if not p.exists():
+        erreur(f"Fichier introuvable : {chemin}")
+        return None
+    if not zipfile.is_zipfile(chemin):
+        erreur(f"Fichier invalide (pas un PPTX/ZIP) : {chemin}")
+        return None
+    info(f"Analyse de {C.BOLD}{p.name}{C.RESET} …")
+    graphes = analyser_pptx(chemin)
+    ok(f"{len(graphes)} graphe(s) trouvé(s)")
+    return graphes
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Extracteur de graphes PPTX → CSV + plots  (stdlib XML uniquement)")
+    parser.add_argument("fichier", nargs="?", help="Fichier .pptx à analyser")
+    parser.add_argument("-o", "--output", default="pptx_export",
+                        help="Dossier de sortie (défaut: pptx_export)")
+    args = parser.parse_args()
+
+    print(f"\n{C.CYAN}{C.BOLD}")
+    print("  ╔══════════════════════════════════════════╗")
+    print("  ║      PPTX CHART EXTRACTOR  v2.0          ║")
+    print("  ║   zipfile + ElementTree — stdlib only    ║")
+    print("  ╚══════════════════════════════════════════╝")
+    print(C.RESET)
+
+    graphes      = []
+    chemin_actif = None
+    dossier_out  = args.output
+
+    if args.fichier:
+        graphes = charger_pptx(args.fichier)
+        if graphes is None:
+            sys.exit(1)
+        chemin_actif = args.fichier
+        afficher_resume(graphes)
+    else:
+        info("Aucun fichier spécifié.")
+        info("Astuce : python pptx_chart_extractor.py presentation.pptx")
+
+    while True:
+        titre("MENU PRINCIPAL")
+        if chemin_actif:
+            info(f"Fichier : {C.BOLD}{Path(chemin_actif).name}{C.RESET}  "
+                 f"({len(graphes)} graphe(s))  →  sortie : {C.BOLD}{dossier_out}/{C.RESET}")
+        else:
+            warn("Aucun fichier chargé")
+
+        choix = menu_numerote("Que veux-tu faire ?", MENU_PRINCIPAL)
+
+        if not graphes and choix not in (5, 6):
+            warn("Charge d'abord un fichier PPTX (option 6).")
+            continue
+
+        if   choix == 0: menu_plot(graphes, dossier_out)
+        elif choix == 1: menu_exporter(graphes, dossier_out)
+        elif choix == 2: menu_tout_exporter(graphes, dossier_out)
+        elif choix == 3: afficher_detail(graphes)
+        elif choix == 4: afficher_resume(graphes)
+        elif choix == 5:
+            chemin = input_prompt("Chemin du fichier PPTX").strip('"').strip("'")
+            g = charger_pptx(chemin)
+            if g is not None:
+                graphes, chemin_actif = g, chemin
+                afficher_resume(graphes)
+        elif choix == 6:
+            print(f"\n  {C.GREEN}Au revoir !{C.RESET}\n")
+            break
+
+if __name__ == "__main__":
+    main()  
