@@ -243,59 +243,59 @@ def extraire_serie_scatter(ser_el):
 
 def construire_df_classique(series_data):
     """
-    Construit un DataFrame depuis plusieurs séries (ligne, barres, pie…).
+    Construit un DataFrame avec une paire de colonnes (X, Y) par série.
+    Format : NomSérie_X | NomSérie_Y | NomSérie2_X | NomSérie2_Y | …
 
-    Stratégie catégories :
-    1. Union ordonnée de toutes les catégories vues dans toutes les séries.
-    2. Chaque série est alignée sur cet index commun par valeur de catégorie.
-    3. Si une série n'a pas de catégories, on aligne par position.
-    4. Les trous sont laissés à None/NaN.
+    Chaque série garde ses propres catégories en X — pas d'union forcée.
+    Les séries de longueurs différentes sont complétées par None.
     """
     if not series_data:
         return pd.DataFrame()
 
-    # ── Construire l'index commun des catégories
-    toutes_cats = []
-    seen = set()
-    for _, cats, _ in series_data:
-        for c in (cats or []):
-            key = str(c) if c is not None else "__vide__"
-            if key not in seen:
-                seen.add(key)
-                toutes_cats.append(c)
-
-    # Aucune catégorie dans aucune série → indices numériques
-    if not toutes_cats:
-        max_len = max((len(vals) for _, _, vals in series_data), default=0)
-        toutes_cats = list(range(max_len))
-
-    cat_index = {(str(c) if c is not None else ""): i for i, c in enumerate(toutes_cats)}
-    df_dict   = {"catégorie": [str(c) if c is not None else "" for c in toutes_cats]}
+    df_dict = {}
+    max_len = 0
 
     for nom, cats, vals in series_data:
-        col = [None] * len(toutes_cats)
+        # Catégories X : strRef/numRef si disponibles, sinon indices
         if cats:
-            # Alignement par valeur de catégorie
-            for cat, val in zip(cats, vals):
-                key = str(cat) if cat is not None else ""
-                if key in cat_index:
-                    col[cat_index[key]] = val
+            xs = [str(c) if c is not None else "" for c in cats]
         else:
-            # Pas de catégories → alignement positionnel
-            for i, val in enumerate(vals):
-                if i < len(col):
-                    col[i] = val
-        df_dict[nom] = col
+            xs = [str(i) for i in range(len(vals))]
+
+        max_len = max(max_len, len(xs), len(vals))
+        df_dict[f"{nom}_X"] = xs
+        df_dict[f"{nom}_Y"] = vals
+
+    # Homogénéiser les longueurs
+    for col in df_dict:
+        diff = max_len - len(df_dict[col])
+        if diff > 0:
+            df_dict[col] = df_dict[col] + [None] * diff
 
     return pd.DataFrame(df_dict)
 
 def construire_df_scatter(series_data):
-    """DataFrame scatter : colonnes [série, x, y]."""
-    rows = []
+    """
+    DataFrame scatter avec paires X/Y par série.
+    Format : NomSérie_X | NomSérie_Y | …
+    """
+    if not series_data:
+        return pd.DataFrame()
+
+    df_dict = {}
+    max_len = 0
+
     for nom, xs, ys in series_data:
-        for x, y in zip(xs, ys):
-            rows.append({"série": nom, "x": x, "y": y})
-    return pd.DataFrame(rows, columns=["série", "x", "y"]) if rows else pd.DataFrame()
+        max_len = max(max_len, len(xs), len(ys))
+        df_dict[f"{nom}_X"] = list(xs)
+        df_dict[f"{nom}_Y"] = list(ys)
+
+    for col in df_dict:
+        diff = max_len - len(df_dict[col])
+        if diff > 0:
+            df_dict[col] = df_dict[col] + [None] * diff
+
+    return pd.DataFrame(df_dict)
 
 def extraire_chart(chart_tree):
     """
@@ -427,9 +427,13 @@ def afficher_detail(graphes):
     print(f"  Balise XML : {g['tag_xml']}")
     print(f"  Famille    : {g['famille']}")
     if not g["df"].empty:
-        print(f"  Lignes     : {len(g['df'])}")
-        print(f"  Colonnes   : {', '.join(str(c) for c in g['df'].columns)}")
-        print(f"\n{g['df'].head(10).to_string(index=False)}\n")
+        df = g["df"]
+        cols_x = [c for c in df.columns if str(c).endswith('_X')]
+        series_noms = [c[:-2] for c in cols_x]
+        print(f"  Lignes     : {len(df)}")
+        print(f"  Séries     : {', '.join(series_noms)}")
+        print(f"  Colonnes   : {', '.join(str(c) for c in df.columns)}")
+        print(f"\n{df.head(10).to_string(index=False)}\n")
     else:
         warn("  Aucune donnée extractible.")
 
@@ -474,13 +478,17 @@ def plot_graphe(g, sauvegarder=False, dossier_out="."):
         _finaliser(fig, g, sauvegarder, dossier_out)
         return
 
+    # Extraire les paires (NomSérie_X, NomSérie_Y) depuis les colonnes
+    cols_x = [c for c in df.columns if str(c).endswith('_X')]
+    series_noms = [c[:-2] for c in cols_x]  # noms sans le suffixe _X / _Y
+    clrs = couleurs(max(len(series_noms), 1))
+
     # ── Scatter ──────────────────────────────────────────────────────────────
     if famille == 'scatter':
-        series_noms = df["série"].unique() if "série" in df.columns else ["Données"]
-        clrs = couleurs(len(series_noms))
         for i, nom in enumerate(series_noms):
-            sous = df[df["série"] == nom]
-            ax.scatter(sous["x"], sous["y"], label=nom, color=clrs[i],
+            xs = pd.to_numeric(df[f"{nom}_X"], errors='coerce')
+            ys = pd.to_numeric(df[f"{nom}_Y"], errors='coerce')
+            ax.scatter(xs, ys, label=nom, color=clrs[i],
                        alpha=0.75, s=45, edgecolors='none')
         style_ax(ax, titre_g, "X", "Y")
         if len(series_noms) > 1:
@@ -488,51 +496,50 @@ def plot_graphe(g, sauvegarder=False, dossier_out="."):
 
     # ── Pie / Donut ───────────────────────────────────────────────────────────
     elif famille == 'pie':
-        col_cat  = df.columns[0]
-        cols_val = [c for c in df.columns[1:]]
-        if cols_val:
-            vals_num = pd.to_numeric(df[cols_val[0]], errors='coerce').dropna()
-            labs     = df[col_cat].iloc[vals_num.index]
-            clrs     = couleurs(len(vals_num))
-            ax.pie(vals_num, labels=labs, autopct='%1.1f%%', startangle=90,
-                   colors=clrs, pctdistance=0.82,
+        # Pour le pie : X = labels, Y = valeurs — on prend la première série
+        if series_noms:
+            nom      = series_noms[0]
+            labs     = df[f"{nom}_X"].dropna()
+            vals_num = pd.to_numeric(df[f"{nom}_Y"], errors='coerce').dropna()
+            idx      = vals_num.index
+            ax.pie(vals_num, labels=labs.iloc[idx] if len(labs) > max(idx) else labs,
+                   autopct='%1.1f%%', startangle=90,
+                   colors=couleurs(len(vals_num)), pctdistance=0.82,
                    wedgeprops=dict(linewidth=0.6, edgecolor='white'))
             ax.set_title(titre_g, fontsize=12, fontweight='bold', pad=10)
 
     # ── Barres ────────────────────────────────────────────────────────────────
     elif famille == 'barres':
-        col_cat  = df.columns[0]
-        cols_val = list(df.columns[1:])
-        x    = np.arange(len(df))
-        n    = len(cols_val)
-        w    = 0.8 / max(n, 1)
-        clrs = couleurs(n)
-        for i, col in enumerate(cols_val):
+        # Référence des labels X depuis la première série
+        x_labels = df[f"{series_noms[0]}_X"].fillna("").tolist() if series_noms else []
+        x        = np.arange(len(df))
+        n        = len(series_noms)
+        w        = 0.8 / max(n, 1)
+        for i, nom in enumerate(series_noms):
             offset = (i - n / 2 + 0.5) * w
-            vals   = pd.to_numeric(df[col], errors='coerce')
+            vals   = pd.to_numeric(df[f"{nom}_Y"], errors='coerce')
             ax.bar(x + offset, vals, width=w * 0.92,
-                   label=col, color=clrs[i], alpha=0.85)
+                   label=nom, color=clrs[i], alpha=0.85)
         ax.set_xticks(x)
-        ax.set_xticklabels(df[col_cat], rotation=30, ha='right', fontsize=8)
-        style_ax(ax, titre_g, col_cat, "Valeur")
+        ax.set_xticklabels(x_labels, rotation=30, ha='right', fontsize=8)
+        style_ax(ax, titre_g, "", "Valeur")
         if n > 1: ax.legend(fontsize=8)
 
     # ── Ligne / Aire / Radar / Surface ────────────────────────────────────────
     else:
-        col_cat  = df.columns[0]
-        cols_val = list(df.columns[1:])
-        clrs = couleurs(len(cols_val))
-        x    = np.arange(len(df))
-        for i, col in enumerate(cols_val):
-            vals = pd.to_numeric(df[col], errors='coerce')
+        # Labels X depuis la première série (partagés si identiques)
+        x_labels = df[f"{series_noms[0]}_X"].fillna("").tolist() if series_noms else []
+        x        = np.arange(len(df))
+        for i, nom in enumerate(series_noms):
+            vals = pd.to_numeric(df[f"{nom}_Y"], errors='coerce')
             if famille == 'aire':
                 ax.fill_between(x, vals, alpha=0.35, color=clrs[i])
-            ax.plot(x, vals, label=col, color=clrs[i],
+            ax.plot(x, vals, label=nom, color=clrs[i],
                     linewidth=1.8, marker='o', markersize=3)
         ax.set_xticks(x)
-        ax.set_xticklabels(df[col_cat], rotation=30, ha='right', fontsize=8)
-        style_ax(ax, titre_g, col_cat, "Valeur")
-        if len(cols_val) > 1: ax.legend(fontsize=8)
+        ax.set_xticklabels(x_labels, rotation=30, ha='right', fontsize=8)
+        style_ax(ax, titre_g, "", "Valeur")
+        if len(series_noms) > 1: ax.legend(fontsize=8)
 
     plt.tight_layout()
     _finaliser(fig, g, sauvegarder, dossier_out)
@@ -676,4 +683,4 @@ def main():
             break
 
 if __name__ == "__main__":
-    main()  
+    main()
