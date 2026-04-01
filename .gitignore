@@ -1,4 +1,4 @@
 # Ignorer tout sauf le script principal et la documentation
-*
+
 !run_aster.sh
 !README.md
