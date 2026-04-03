@@ -21,6 +21,12 @@ except ImportError as e:
     print("Installe les dépendances : pip install pandas matplotlib numpy")
     sys.exit(1)
 
+try:
+    import openpyxl
+    EXCEL_OK = True
+except ImportError:
+    EXCEL_OK = False
+
 # ─── Couleurs terminal ──────────────────────────────────────────────────────
 class C:
     BOLD   = "\033[1m"
@@ -43,6 +49,36 @@ def info(texte):    print(f"  {C.BLUE}ℹ {C.RESET}{texte}")
 def ok(texte):      print(f"  {C.GREEN}✔ {C.RESET}{texte}")
 def warn(texte):    print(f"  {C.YELLOW}⚠ {C.RESET}{texte}")
 def erreur(texte):  print(f"  {C.RED}✘ {C.RESET}{texte}")
+
+# ─── Séparateurs ────────────────────────────────────────────────────────────────
+SEPARATEURS = {
+    "1": ("Auto-détection",     None),
+    "2": ("Virgule      ( , )", ","),
+    "3": ("Point-virgule ( ; )", ";"),
+    "4": ("Tabulation   ( \\t )", "\t"),
+    "5": ("Pipe         ( | )", "|"),
+    "6": ("Espace       (   )", " "),
+}
+
+SEP_EXPORT = {
+    "1": ("Virgule      ( , )", ","),
+    "2": ("Point-virgule ( ; )", ";"),
+    "3": ("Tabulation   ( \\t )", "\t"),
+    "4": ("Pipe         ( | )", "|"),
+}
+
+def choisir_separateur(titre_q="Séparateur :", avec_auto=True):
+    """Sélectionne un séparateur via menu numéroté."""
+    table = SEPARATEURS if avec_auto else SEP_EXPORT
+    print(f"\n{C.BOLD}  {titre_q}{C.RESET}")
+    for k, (label, _) in table.items():
+        print(f"    {C.CYAN}{k}{C.RESET}. {label}")
+    print()
+    while True:
+        entree = input(f"  {C.BOLD}Choix{C.RESET} : ").strip()
+        if entree in table:
+            return table[entree][1]
+        erreur("Entrée invalide, réessaie.")
 
 def menu_numerote(titre_menu, options, allow_multiple=False):
     """Affiche un menu numéroté et retourne le(s) choix."""
@@ -94,7 +130,7 @@ def charger_csv(chemin, sep=None):
         erreur(f"Impossible de charger {chemin} : {e}")
         return None, None
 
-def charger_fichiers(chemins):
+def charger_fichiers(chemins, sep=None):
     """Charge plusieurs fichiers CSV."""
     datasets = {}
     for chemin in chemins:
@@ -102,10 +138,10 @@ def charger_fichiers(chemins):
         if not p.exists():
             warn(f"Fichier introuvable : {chemin}")
             continue
-        df, sep = charger_csv(chemin)
+        df, sep_utilise = charger_csv(chemin, sep)
         if df is not None:
-            datasets[p.stem] = {"df": df, "chemin": chemin, "sep": sep}
-            ok(f"Chargé : {C.BOLD}{p.name}{C.RESET}  ({len(df)} lignes, {len(df.columns)} colonnes, sep='{sep}')")
+            datasets[p.stem] = {"df": df, "chemin": chemin, "sep": sep_utilise}
+            ok(f"Chargé : {C.BOLD}{p.name}{C.RESET}  ({len(df)} lignes, {len(df.columns)} colonnes, sep='{sep_utilise}')")
     return datasets
 
 def ajouter_fichier(datasets):
@@ -115,10 +151,11 @@ def ajouter_fichier(datasets):
     if not p.exists():
         erreur(f"Fichier introuvable : {chemin}")
         return
-    df, sep = charger_csv(chemin)
+    sep = choisir_separateur("Séparateur du fichier :", avec_auto=True)
+    df, sep_utilise = charger_csv(chemin, sep)
     if df is not None:
-        datasets[p.stem] = {"df": df, "chemin": chemin, "sep": sep}
-        ok(f"Ajouté : {C.BOLD}{p.name}{C.RESET}")
+        datasets[p.stem] = {"df": df, "chemin": chemin, "sep": sep_utilise}
+        ok(f"Ajouté : {C.BOLD}{p.name}{C.RESET}  (sep='{sep_utilise}')")
 
 # ─── Aperçu des données ─────────────────────────────────────────────────────
 def afficher_apercu(datasets):
@@ -253,6 +290,13 @@ def choisir_datasets(datasets, allow_multiple=True):
         idx = menu_numerote("Quel fichier ?", noms)
         return [noms[idx]]
 
+def demander_titres(titre_defaut="", xlabel_defaut="", ylabel_defaut=""):
+    """Demande interactivement le titre du graphe et les labels des axes."""
+    t = input_prompt("Titre du graphe", titre_defaut)
+    x = input_prompt("Label axe X",    xlabel_defaut)
+    y = input_prompt("Label axe Y",    ylabel_defaut)
+    return (t or titre_defaut), (x or xlabel_defaut), (y or ylabel_defaut)
+
 # ─── Types de graphes ───────────────────────────────────────────────────────
 TYPES_GRAPHE = {
     "Ligne (X vs Y)":           "ligne",
@@ -308,6 +352,9 @@ def graphe_ligne(datasets, selection):
     if not series_configs:
         return
 
+    x_def = ", ".join(dict.fromkeys(c[1] for c in series_configs))
+    titre_g, xlabel, ylabel = demander_titres("Graphe Ligne", x_def, "Valeur")
+
     fig, ax = plt.subplots(figsize=(10, 5))
     clrs = couleurs_datasets(len(series_configs))
     for i, (nom, col_x, col_y) in enumerate(series_configs):
@@ -316,8 +363,7 @@ def graphe_ligne(datasets, selection):
         ax.plot(df[col_x], df[col_y], label=label, color=clrs[i],
                 linewidth=1.8, marker='o', markersize=3)
 
-    x_labels = ", ".join(set(cfg[1] for cfg in series_configs))
-    appliquer_style(ax, "Graphe Ligne", x_labels, "Valeur")
+    appliquer_style(ax, titre_g, xlabel, ylabel)
     ax.legend(fontsize=8)
     plt.tight_layout()
     plt.show()
@@ -351,6 +397,9 @@ def graphe_scatter(datasets, selection):
     if not series_configs:
         return
 
+    x_def = ", ".join(dict.fromkeys(c[1] for c in series_configs))
+    titre_g, xlabel, ylabel = demander_titres("Nuage de points", x_def, "Y")
+
     fig, ax = plt.subplots(figsize=(8, 6))
     clrs = couleurs_datasets(len(series_configs))
     for i, (nom, col_x, col_y) in enumerate(series_configs):
@@ -359,8 +408,7 @@ def graphe_scatter(datasets, selection):
         ax.scatter(df[col_x], df[col_y], label=label, color=clrs[i],
                    alpha=0.65, s=30, edgecolors='none')
 
-    x_labels = ", ".join(set(cfg[1] for cfg in series_configs))
-    appliquer_style(ax, "Nuage de points", x_labels, "Y")
+    appliquer_style(ax, titre_g, xlabel, ylabel)
     if len(series_configs) > 1:
         ax.legend(fontsize=8)
     plt.tight_layout()
@@ -395,6 +443,9 @@ def graphe_barres(datasets, selection):
     if not series_configs:
         return
 
+    x_def = ", ".join(dict.fromkeys(c[1] for c in series_configs))
+    titre_g, xlabel, ylabel = demander_titres("Graphe Barres", x_def, "Valeur")
+
     fig, ax = plt.subplots(figsize=(10, 5))
     n    = len(series_configs)
     clrs = couleurs_datasets(n)
@@ -417,8 +468,7 @@ def graphe_barres(datasets, selection):
             ax.set_xticks(x)
             ax.set_xticklabels(grouped[col_x], rotation=45, ha='right', fontsize=8)
 
-    x_labels = ", ".join(set(cfg[1] for cfg in series_configs))
-    appliquer_style(ax, "Graphe Barres", x_labels, "Valeur")
+    appliquer_style(ax, titre_g, xlabel, ylabel)
     if n > 1: ax.legend(fontsize=8)
     plt.tight_layout()
     plt.show()
@@ -433,6 +483,8 @@ def graphe_histo(datasets, selection):
     try: bins = int(bins_str)
     except: bins = 20
 
+    titre_g, xlabel, ylabel = demander_titres(f"Distribution : {col}", col, "Fréquence")
+
     fig, ax = plt.subplots(figsize=(9, 5))
     couleurs = couleurs_datasets(len(selection))
     for i, nom in enumerate(selection):
@@ -440,7 +492,7 @@ def graphe_histo(datasets, selection):
         if col not in df.columns: continue
         ax.hist(df[col].dropna(), bins=bins, label=nom, color=couleurs[i], alpha=0.6, edgecolor='white', linewidth=0.5)
 
-    appliquer_style(ax, f"Distribution : {col}", col, "Fréquence")
+    appliquer_style(ax, titre_g, xlabel, ylabel)
     if len(selection) > 1: ax.legend(fontsize=8)
     plt.tight_layout()
     plt.show()
@@ -452,6 +504,8 @@ def graphe_boxplot(datasets, selection):
     cols = choisir_colonne_multi(df_ref, "Colonnes à comparer", filtre_num=True)
     if not cols:
         return
+
+    titre_g, _, ylabel = demander_titres("Boîtes à moustaches", "", "Valeur")
 
     fig, axes = plt.subplots(1, len(cols), figsize=(4 * len(cols), 5), squeeze=False)
     couleurs = couleurs_datasets(len(selection))
@@ -474,8 +528,10 @@ def graphe_boxplot(datasets, selection):
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         ax.tick_params(axis='x', rotation=20)
+        if ylabel:
+            ax.set_ylabel(ylabel, fontsize=10)
 
-    fig.suptitle("Boîtes à moustaches", fontsize=13, fontweight='bold')
+    fig.suptitle(titre_g, fontsize=13, fontweight='bold')
     plt.tight_layout()
     plt.show()
 
@@ -492,11 +548,13 @@ def graphe_aire(datasets, selection):
     if not cols_y:
         return
 
+    titre_g, xlabel, ylabel = demander_titres(f"Aire empilée — {nom}", col_x or "", "Valeur cumulée")
+
     fig, ax = plt.subplots(figsize=(10, 5))
     clrs = couleurs_datasets(len(cols_y))
     ax.stackplot(df[col_x], [df[c] for c in cols_y if c in df.columns],
                  labels=cols_y, colors=clrs, alpha=0.8)
-    appliquer_style(ax, f"Aire empilée — {nom}", col_x, "Valeur cumulée")
+    appliquer_style(ax, titre_g, xlabel, ylabel)
     ax.legend(fontsize=8, loc='upper left')
     plt.tight_layout()
     plt.show()
@@ -512,6 +570,8 @@ def graphe_heatmap(datasets, selection):
         erreur("Pas assez de colonnes numériques pour une heatmap.")
         return
 
+    titre_g, _, _ = demander_titres(f"Matrice de corrélation — {nom}")
+
     corr = df[cols_num].corr()
     fig, ax = plt.subplots(figsize=(max(6, len(cols_num)), max(5, len(cols_num) - 1)))
     im = ax.imshow(corr, cmap='RdBu_r', vmin=-1, vmax=1, aspect='auto')
@@ -525,7 +585,7 @@ def graphe_heatmap(datasets, selection):
             val = corr.iloc[i, j]
             ax.text(j, i, f"{val:.2f}", ha='center', va='center', fontsize=7,
                     color='white' if abs(val) > 0.5 else 'black')
-    ax.set_title(f"Matrice de corrélation — {nom}", fontsize=12, fontweight='bold', pad=12)
+    ax.set_title(titre_g, fontsize=12, fontweight='bold', pad=12)
     plt.tight_layout()
     plt.show()
 
@@ -554,15 +614,133 @@ def menu_graphe(datasets):
     dispatch[type_graphe](datasets, selection)
 
 # ─── Exportation ──────────────────────
+def _formats_export():
+    fmts = ["CSV", "TSV (tabulation)", "TXT (espace)", "JSON", "Parquet"]
+    if EXCEL_OK:
+        fmts.insert(4, "Excel (.xlsx)")
+    return fmts
+
 def exporter_merge(datasets):
     """Fusionne et exporte les datasets sélectionnés."""
     titre("EXPORTER / FUSIONNER")
     selection = choisir_datasets(datasets)
+
     dfs = [datasets[n]["df"].assign(_source=n) for n in selection]
     merged = pd.concat(dfs, ignore_index=True)
-    chemin_out = input_prompt("Nom du fichier de sortie", "export_merge.csv")
-    merged.to_csv(chemin_out, index=False)
-    ok(f"Exporté : {chemin_out}  ({len(merged)} lignes)")
+
+    # ── Sélection des colonnes à exporter ─────────────────────────────────────
+    toutes_cols = merged.columns.tolist()
+    idxs_cols = menu_numerote(
+        f"Colonnes à exporter (ex: 1 3 5 ou 'all') — {len(toutes_cols)} colonnes :",
+        toutes_cols,
+        allow_multiple=True,
+    )
+    cols_export = [toutes_cols[i] for i in idxs_cols]
+    if not cols_export:
+        warn("Aucune colonne sélectionnée, export annulé.")
+        return
+    merged = merged[cols_export]
+
+    # ── Format ────────────────────────────────────────────────────────────────
+    fmts = _formats_export()
+    idx_fmt = menu_numerote("Format d'export :", fmts)
+    fmt = fmts[idx_fmt]
+
+    ext_defaut = {
+        "CSV":              ".csv",
+        "TSV (tabulation)": ".tsv",
+        "TXT (espace)":     ".txt",
+        "JSON":             ".json",
+        "Excel (.xlsx)":    ".xlsx",
+        "Parquet":          ".parquet",
+    }
+    chemin_out = input_prompt("Nom du fichier de sortie", f"export_merge{ext_defaut.get(fmt, '.csv')}")
+
+    try:
+        if fmt == "CSV":
+            sep = choisir_separateur("Séparateur CSV :", avec_auto=False)
+            merged.to_csv(chemin_out, index=False, sep=sep, encoding="utf-8-sig")
+
+        elif fmt == "TSV (tabulation)":
+            merged.to_csv(chemin_out, index=False, sep="\t", encoding="utf-8-sig")
+
+        elif fmt == "TXT (espace)":
+            merged.to_csv(chemin_out, index=False, sep=" ", encoding="utf-8-sig")
+
+        elif fmt == "JSON":
+            orients = [
+                "records  — liste d'objets  [ {col: val, …}, … ]",
+                "table    — avec schéma de types",
+                "index    — dictionnaire indexé",
+            ]
+            orient_map = {
+                "records  — liste d'objets  [ {col: val, …}, … ]": "records",
+                "table    — avec schéma de types":                  "table",
+                "index    — dictionnaire indexé":                   "index",
+            }
+            idx_orient = menu_numerote("Format JSON :", orients)
+            orient = orient_map[orients[idx_orient]]
+            merged.to_json(chemin_out, orient=orient, force_ascii=False, indent=2)
+
+        elif fmt == "Excel (.xlsx)":
+            sheet = input_prompt("Nom de la feuille", "Données")
+            merged.to_excel(chemin_out, index=False, sheet_name=sheet)
+
+        elif fmt == "Parquet":
+            merged.to_parquet(chemin_out, index=False)
+
+        ok(f"Exporté : {chemin_out}  ({len(merged)} lignes, {len(merged.columns)} colonnes)")
+
+    except Exception as e:
+        erreur(f"Erreur lors de l'export : {e}")
+
+# ─── Division par groupes de colonnes ──────────────────────────────────────────
+def diviser_par_groupes(datasets):
+    """
+    Détecte les groupes de lignes partageant le même ensemble de colonnes
+    non-nulles et les enregistre comme datasets distincts.
+    """
+    titre("DIVISER PAR GROUPES DE COLONNES")
+    noms = list(datasets.keys())
+    idx = menu_numerote("Quel dataset à diviser ?", noms)
+    nom = noms[idx]
+    df = datasets[nom]["df"]
+
+    signatures = df.apply(
+        lambda row: frozenset(df.columns[row.notna()].tolist()), axis=1
+    )
+    groupes = signatures.unique()
+
+    if len(groupes) == 1:
+        warn("Toutes les lignes ont le même ensemble de colonnes — rien à diviser.")
+        return
+
+    info(f"{len(groupes)} groupe(s) détecté(s) :")
+    groupes_tries = sorted(groupes, key=lambda g: -signatures.value_counts()[g])
+    for i, g in enumerate(groupes_tries):
+        n_lignes = (signatures == g).sum()
+        cols = ", ".join(sorted(g))
+        print(f"    {C.CYAN}{i+1}{C.RESET}. ({n_lignes} lignes)  {C.DIM}{cols}{C.RESET}")
+    print()
+
+    confirmer = input_prompt(f"Créer {len(groupes_tries)} sous-datasets ? (o/n)", "o")
+    if confirmer.lower() not in ("o", "oui", "y", "yes"):
+        return
+
+    for i, sig in enumerate(groupes_tries):
+        masque = signatures == sig
+        sous_df = df[masque][sorted(sig)].reset_index(drop=True)
+        cols_courtes = "_".join(c[:6] for c in sorted(sig))
+        sous_nom_defaut = f"{nom}_g{i+1}_{cols_courtes}"[:40]
+        sous_nom = input_prompt(f"Nom du sous-dataset {i+1}/{len(groupes_tries)}", sous_nom_defaut)
+        if not sous_nom:
+            sous_nom = sous_nom_defaut
+        datasets[sous_nom] = {
+            "df": sous_df,
+            "chemin": f"(issu de {datasets[nom]['chemin']})",
+            "sep": datasets[nom]["sep"],
+        }
+        ok(f"Créé : {C.BOLD}{sous_nom}{C.RESET}  ({len(sous_df)} lignes)")
 
 # ─── Menu principal ─────────────────────────────────────────────────────────
 MENU_PRINCIPAL = [
@@ -570,6 +748,7 @@ MENU_PRINCIPAL = [
     "Aperçu des données",
     "Statistiques descriptives",
     "Ajouter un fichier CSV",
+    "Diviser par groupes de colonnes",
     "Exporter / Fusionner",
     "Quitter",
 ]
@@ -577,11 +756,16 @@ MENU_PRINCIPAL = [
 def main():
     parser = argparse.ArgumentParser(description="Comparateur interactif de fichiers CSV")
     parser.add_argument("fichiers", nargs="*", help="Fichiers CSV à charger au démarrage")
+    parser.add_argument(
+        "--sep",
+        help="Séparateur forcé au chargement (ex: , ; \\t |)",
+        default=None,
+    )
     args = parser.parse_args()
 
     print(f"\n{C.CYAN}{C.BOLD}")
     print("  ╔══════════════════════════════════════════╗")
-    print("  ║        CSV COMPARATOR  v2.0              ║")
+    print("  ║        CSV COMPARATOR  v3.0              ║")
     print("  ║   Comparateur interactif de fichiers     ║")
     print("  ╚══════════════════════════════════════════╝")
     print(C.RESET)
@@ -590,10 +774,11 @@ def main():
 
     if args.fichiers:
         titre("CHARGEMENT DES FICHIERS")
-        datasets = charger_fichiers(args.fichiers)
+        sep = args.sep.replace("\\t", "\t") if args.sep else None
+        datasets = charger_fichiers(args.fichiers, sep=sep)
     else:
         info("Aucun fichier spécifié. Utilise le menu pour en ajouter.")
-        info("Astuce : python csv_comparator.py fichier1.csv fichier2.csv")
+        info("Astuce : python comparecsv.py fichier1.csv fichier2.csv [--sep ,]")
 
     while True:
         titre("MENU PRINCIPAL")
@@ -615,9 +800,12 @@ def main():
         elif choix == 3:
             ajouter_fichier(datasets)
         elif choix == 4:
-            if datasets: exporter_merge(datasets)
+            if datasets: diviser_par_groupes(datasets)
             else: warn("Aucun fichier chargé.")
         elif choix == 5:
+            if datasets: exporter_merge(datasets)
+            else: warn("Aucun fichier chargé.")
+        elif choix == 6:
             print(f"\n  {C.GREEN}Au revoir !{C.RESET}\n")
             break
 
