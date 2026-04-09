@@ -7,68 +7,46 @@
 #
 #  ARCHITECTURE EN DEUX PHASES DANS UN SEUL FICHIER
 #  ─────────────────────────────────────────────────
-#  Ce script joue deux roles selon le contexte dans lequel il est appele :
-#
 #    Phase 1 — noeud login (appel direct par l'utilisateur)
 #      · Detecte les fichiers d'entree (.comm, .med, .mail, base, rmed)
-#      · Cree un dossier scratch unique sur le systeme de fichiers partage
-#      · Copie les fichiers d'entree dans le scratch
-#      · Genere le fichier .export qui configure le calcul Code_Aster
+#      · Analyse le .comm pour detecter automatiquement les UNITE requises
+#      · Valide la coherence .comm / fichiers / .export avant soumission
+#      · Cree un dossier scratch, copie les entrees, genere le .export
 #      · Soumet CE MEME script via sbatch avec __RUN_PHASE=EXEC
 #
 #    Phase 2 — noeud de calcul (appel par sbatch)
-#      · Detectee par la variable d'environnement __RUN_PHASE=EXEC
-#      · Charge Code_Aster via module ou chemin direct
-#      · Lance le calcul en passant le .export a run_aster/as_run
-#      · Analyse le fichier .mess (alarmes, erreurs)
-#      · Rapatrie les resultats vers le dossier d'etude
-#      · Nettoie le scratch
+#      · Lance le calcul, analyse le .mess, rapatrie les resultats
 #
-#  NOTE MPI : run_aster/as_run lance lui-meme les processus MPI en interne.
-#  Ne pas l'encapsuler dans srun, cela provoquerait une double initialisation
-#  MPI et des conflits de gestionnaires de processus.
+#  NOTE MPI : run_aster gere MPI en interne — ne PAS encapsuler dans srun.
 #
 #  Auteur  : Teo LEROY
-#  Version : 11.0
+#  Version : 12.0
 #===============================================================================
 
 # ══════════════════════════════════════════
 #  CONFIGURATION GLOBALE
-#  Ces trois variables peuvent etre surchargees par variable d'environnement
-#  avant d'appeler le script (ex: export ASTER_ROOT=/logiciels/aster/17.1).
-#  La syntaxe ${VAR:-valeur} signifie : utiliser $VAR si definie, sinon valeur.
 # ══════════════════════════════════════════
 
-ASTER_ROOT="${ASTER_ROOT:-/opt/code_aster}"   # Racine de l'installation Code_Aster
-ASTER_MODULE="${ASTER_MODULE:-}"    # Nom du module Lmod a charger
-SCRATCH_BASE="${SCRATCH_BASE:-/scratch}"      # Racine du filesystem scratch (partage login/calcul)
+ASTER_ROOT="${ASTER_ROOT:-/opt/code_aster}"
+ASTER_MODULE="${ASTER_MODULE:-}"
+SCRATCH_BASE="${SCRATCH_BASE:-/scratch}"
 
-# Ressources Slurm par defaut (utilisees si aucune option ni preset n'est donne)
+# Ressources Slurm par defaut
 DEFAULT_PARTITION="court"
 DEFAULT_NODES=1
-DEFAULT_NTASKS=1     # Nombre de taches MPI par defaut
-DEFAULT_CPUS=1       # CPUs par tache MPI (threading OpenMP, generalement 1)
+DEFAULT_NTASKS=1
+DEFAULT_CPUS=1
 DEFAULT_MEM="5G"
 DEFAULT_TIME="05:00:00"
 
-# Presets : raccourcis pour les configurations typiques du cluster.
-# Chaque preset definit partition, ntasks, memoire et duree maximale.
-# Les valeurs peuvent etre surchargees apres -P (ex: -P moyen -t 8).
-PRESET_COURT_PARTITION="court"  ; PRESET_COURT_NTASKS=1  ; PRESET_COURT_MEM="2G"  ; PRESET_COURT_TIME="05:00:00"
-PRESET_MOYEN_PARTITION="normal"  ; PRESET_MOYEN_NTASKS=1  ; PRESET_MOYEN_MEM="20G"  ; PRESET_MOYEN_TIME="03-00:00:00"
-PRESET_LONG_PARTITION="long"    ; PRESET_LONG_NTASKS=1   ; PRESET_LONG_MEM="50G"  ; PRESET_LONG_TIME="30-00:00:00"
+# Presets
+declare -A PRESET_PARTITION=([court]="court"  [moyen]="normal" [long]="long")
+declare -A PRESET_NTASKS=(   [court]=1        [moyen]=1        [long]=1)
+declare -A PRESET_MEM=(      [court]="2G"     [moyen]="20G"    [long]="50G")
+declare -A PRESET_TIME=(     [court]="05:00:00" [moyen]="03-00:00:00" [long]="30-00:00:00")
 
 # ══════════════════════════════════════════
-#  FONCTIONS D'AFFICHAGE
-#  Codes couleurs ANSI pour le terminal. NC = No Color (reinitialise).
-#  Chaque fonction correspond a un niveau de message :
-#    info  : information normale (bleu)
-#    ok    : validation, succes (vert)
-#    warn  : avertissement non bloquant (jaune), stderr
-#    err   : erreur bloquante (rouge), stderr
-#    log   : message horodate pour les logs du noeud de calcul
-#    section : titre de section avec separateur (Phase 1)
-#    header  : encadre large (Phase 2, dans les logs sbatch)
+#  AFFICHAGE
 # ══════════════════════════════════════════
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -80,33 +58,14 @@ warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 err()     { echo -e "${RED}[ ERR]${NC}  $*" >&2; }
 log()     { echo "[$(date +%H:%M:%S)] $*"; }
 section() { echo -e "\n${BOLD}${CYAN}> $*${NC}"; echo -e "${CYAN}$(printf -- '-%.0s' {1..60})${NC}"; }
-header()  {
-    echo ""
-    echo "========================================================"
-    echo "  $*"
-    echo "========================================================"
-}
+header()  { echo ""; echo "========================================================"; echo "  $*"; echo "========================================================"; }
 
 # ══════════════════════════════════════════
-#  NAVIGATION CLAVIER — menus interactifs flèches ↑↓
-#
-#  Trois fonctions principales :
-#    menu_fleches "Question" "opt1" "opt2" ...
-#        → sélection unique, résultat dans $_MENU_IDX (0-based, -1 si Ctrl+C)
-#    menu_cases "Question" "opt1" "opt2" ...
-#        → cases à cocher (espace), résultat dans $_MENU_ITEMS (indices cochés)
-#    saisir "Label" "defaut"
-#        → saisie texte, résultat dans $_SAISIE
-#
-#  Tout le rendu va sur /dev/tty pour ne pas polluer stdout.
+#  NAVIGATION CLAVIER — menus interactifs
 # ══════════════════════════════════════════
 
-_MENU_IDX=0
-_MENU_ITEMS=()
-_SAISIE=""
-_TOUCHE=""
+_MENU_IDX=0; _MENU_ITEMS=(); _SAISIE=""; _TOUCHE=""
 
-# Lit une touche — capture les séquences ESC (flèches = ESC [ A/B)
 _lire_touche() {
     local k1 k2 k3
     IFS= read -r -s -n1 k1 </dev/tty
@@ -119,11 +78,8 @@ _lire_touche() {
     fi
 }
 
-# Dessine les lignes d'un menu simple (utilisé par menu_fleches)
 _dessiner_menu() {
-    local sel="$1"; shift
-    local i
-    local opts=("$@")
+    local sel="$1"; shift; local opts=("$@")
     for ((i=0; i<${#opts[@]}; i++)); do
         if ((i == sel)); then
             printf "  ${CYAN}${BOLD}❯ %-55s${NC}\n" "${opts[$i]}" >/dev/tty
@@ -133,13 +89,9 @@ _dessiner_menu() {
     done
 }
 
-# Dessine les lignes d'un menu cases (utilisé par menu_cases)
-# $_COCHES est un tableau global 0/1 partagé avec menu_cases
 _COCHES=()
 _dessiner_cases() {
-    local sel="$1"; shift
-    local opts=("$@")
-    local i marq
+    local sel="$1"; shift; local opts=("$@"); local i marq
     for ((i=0; i<${#opts[@]}; i++)); do
         [ "$i" -eq "$sel" ] && marq="${CYAN}${BOLD}❯${NC}" || marq=" "
         if [ "${_COCHES[$i]}" = "1" ]; then
@@ -150,88 +102,61 @@ _dessiner_cases() {
     done
 }
 
-# Sélection unique avec flèches — résultat dans $_MENU_IDX
 menu_fleches() {
-    local msg="$1"; shift
-    local opts=("$@")
-    local n=${#opts[@]}
-    local sel=0
-
+    local msg="$1"; shift; local opts=("$@"); local n=${#opts[@]} sel=0
     printf "\n${BOLD}  %s${NC}\n" "$msg" >/dev/tty
     tput civis >/dev/tty 2>/dev/null || true
     _dessiner_menu "$sel" "${opts[@]}"
-
     while true; do
         _lire_touche
         case "$_TOUCHE" in
-            $'\x1b[A') sel=$(( (sel - 1 + n) % n )) ;;   # Flèche haut
-            $'\x1b[B') sel=$(( (sel + 1) % n ))     ;;   # Flèche bas
-            $'\x0d'|$'\x0a'|'') break ;;                   # Entrée (CR, LF, ou vide)
-            $'\x03')                                       # Ctrl+C
-                tput cnorm >/dev/tty 2>/dev/null || true
-                printf "\n" >/dev/tty
-                _MENU_IDX=-1; return ;;
+            $'\x1b[A') sel=$(( (sel - 1 + n) % n )) ;;
+            $'\x1b[B') sel=$(( (sel + 1) % n ))     ;;
+            $'\x0d'|$'\x0a'|'') break ;;
+            $'\x03') tput cnorm >/dev/tty 2>/dev/null || true; printf "\n" >/dev/tty; _MENU_IDX=-1; return ;;
         esac
         printf "\033[%dA" "$n" >/dev/tty
         _dessiner_menu "$sel" "${opts[@]}"
     done
-
-    # Affichage final : ✔ sur la sélection, effacer les autres
     printf "\033[%dA" "$n" >/dev/tty
-    local i
     for ((i=0; i<n; i++)); do
         if ((i == sel)); then
             printf "  ${GREEN}✔ ${BOLD}%-55s${NC}\n" "${opts[$i]}" >/dev/tty
         else
-            printf "\033[2K\r\033[1B" >/dev/tty   # effacer + descendre sans imprimer
+            printf "\033[2K\r\033[1B" >/dev/tty
         fi
     done
     tput cnorm >/dev/tty 2>/dev/null || true
     _MENU_IDX="$sel"
 }
 
-# Sélection multiple avec espace — résultat dans $_MENU_ITEMS
 menu_cases() {
-    local msg="$1"; shift
-    local opts=("$@")
-    local n=${#opts[@]}
-    local sel=0
-    local i
-    _COCHES=()
-    for ((i=0; i<n; i++)); do _COCHES[$i]=0; done
-
-    printf "\n${BOLD}  %s${NC}\n"                                                              "$msg" >/dev/tty
-    printf "  ${DIM}(espace : cocher/décocher  —  a : tout  —  i : inverser  —  entrée : valider)${NC}\n" >/dev/tty
+    local msg="$1"; shift; local opts=("$@"); local n=${#opts[@]} sel=0 i
+    _COCHES=(); for ((i=0; i<n; i++)); do _COCHES[$i]=0; done
+    printf "\n${BOLD}  %s${NC}\n" "$msg" >/dev/tty
+    printf "  ${DIM}(espace : cocher  —  a : tout  —  i : inverser  —  entrée : valider)${NC}\n" >/dev/tty
     tput civis >/dev/tty 2>/dev/null || true
     _dessiner_cases "$sel" "${opts[@]}"
-
     while true; do
         _lire_touche
         local j
         case "$_TOUCHE" in
             $'\x1b[A') sel=$(( (sel - 1 + n) % n )) ;;
             $'\x1b[B') sel=$(( (sel + 1) % n ))     ;;
-            ' ')        _COCHES[$sel]=$(( _COCHES[sel] ^ 1 ))       ;;   # Toggle
-            'a')        for ((j=0; j<n; j++)); do _COCHES[$j]=1; done ;;   # Tout cocher
-            'i')        for ((j=0; j<n; j++)); do _COCHES[$j]=$(( _COCHES[j] ^ 1 )); done ;; # Inverser
+            ' ')        _COCHES[$sel]=$(( _COCHES[sel] ^ 1 )) ;;
+            'a')        for ((j=0; j<n; j++)); do _COCHES[$j]=1; done ;;
+            'i')        for ((j=0; j<n; j++)); do _COCHES[$j]=$(( _COCHES[j] ^ 1 )); done ;;
             $'\x0d'|$'\x0a'|'') break ;;
-            $'\x03')
-                tput cnorm >/dev/tty 2>/dev/null || true
-                printf "\n" >/dev/tty
-                _MENU_ITEMS=(); return ;;
+            $'\x03') tput cnorm >/dev/tty 2>/dev/null || true; printf "\n" >/dev/tty; _MENU_ITEMS=(); return ;;
         esac
         printf "\033[%dA" "$n" >/dev/tty
         _dessiner_cases "$sel" "${opts[@]}"
     done
-
     tput cnorm >/dev/tty 2>/dev/null || true
     _MENU_ITEMS=()
-    for ((i=0; i<n; i++)); do
-        [ "${_COCHES[$i]}" = "1" ] && _MENU_ITEMS+=("$i")
-    done
+    for ((i=0; i<n; i++)); do [ "${_COCHES[$i]}" = "1" ] && _MENU_ITEMS+=("$i"); done
 }
 
-# Saisie texte avec valeur par défaut — résultat dans $_SAISIE
 saisir() {
     local msg="$1" defaut="${2:-}"
     if [ -n "$defaut" ]; then
@@ -244,105 +169,275 @@ saisir() {
 }
 
 # ══════════════════════════════════════════
-#  LECTURE DU .comm — détection des sorties
+#  UTILITAIRES
+# ══════════════════════════════════════════
+
+# Cherche les fichiers d'un type dans un dossier, retourne le premier
+# Usage: _find_first STUDY_DIR "*.comm" → imprime le chemin ou rien
+_find_first() {
+    local dir="$1" pattern="$2"
+    local -a arr=()
+    shopt -s nullglob; arr=("${dir}"/${pattern}); shopt -u nullglob
+    [ ${#arr[@]} -ge 1 ] && echo "${arr[0]}"
+    [ ${#arr[@]} -gt 1 ] && warn "Plusieurs ${pattern} trouves, utilisation du premier" >&2
+}
+
+# Compte les fichiers d'un type
+_count_files() {
+    local dir="$1" pattern="$2"
+    local -a arr=()
+    shopt -s nullglob; arr=("${dir}"/${pattern}); shopt -u nullglob
+    echo "${#arr[@]}"
+}
+
+# ══════════════════════════════════════════
+#  ANALYSE DU .comm — detection des UNITE et validation
 #
-#  Lit le fichier .comm et remplit $_COMM_OUTPUTS avec les commandes
-#  d'impression trouvées (IMPR_RESU, IMPR_TABLE, DEFI_FICHIER).
-#
-#  Problème des commandes multi-lignes :
-#    Un .comm est du Python ; une même commande peut s'étaler sur
-#    plusieurs lignes entre une parenthèse ouvrante et sa fermante.
-#    Un grep ligne par ligne raterait l'association entre le nom de
-#    la commande et son UNITE= situé sur une autre ligne.
-#
-#  Solution : awk accumule les lignes dans un buffer jusqu'à ce que
-#    le compteur de parenthèses revienne à 0 (bloc complet), puis
-#    émet le bloc aplati sur une seule ligne. Les patterns sont ensuite
-#    cherchés dans ce bloc, qui contient toute la commande.
-#
-#  Format des entrées dans $_COMM_OUTPUTS : "label|type|unite"
-#    label : texte affiché dans le menu
-#    type  : extension pour le .export (rmed, table, resu, dat…)
-#    unite : numéro d'unité logique Fortran
-#
-#  Unités 1, 6, 8, 20, 80 : déjà dans le .export par défaut → ignorées.
+#  Deux fonctions :
+#    _parse_comm_outputs  : detecte les IMPR_RESU/IMPR_TABLE/DEFI_FICHIER
+#                           et leurs UNITE → remplit $_COMM_OUTPUTS
+#    _validate_comm       : verifie la coherence globale du .comm :
+#                           - UNITE de maillage vs fichiers presents
+#                           - UNITE de sortie non declarees dans le .export
+#                           - Commandes INCLUDE avec fichiers absents
+#                           - POURSUITE sans base disponible
 # ══════════════════════════════════════════
 
 _COMM_OUTPUTS=()
-_parse_comm_outputs() {
-    local comm_file="$1"
-    _COMM_OUTPUTS=()
 
-    # ── Aplatissement multi-lignes ─────────────────────────────────
-    # awk lit ligne par ligne, accumule dans buf, et compte les '(' / ')'.
-    # Quand depth revient à 0, le bloc est complet : on l'émet aplati.
-    # Les lignes de commentaires Python (#…) sont ignorées avant comptage
-    # pour éviter des faux déséquilibres du style  # ( commentaire.
-    local flat
-    flat=$(awk '
+# Aplatit les blocs multi-lignes Python du .comm en lignes uniques
+_flatten_comm() {
+    awk '
     BEGIN { buf=""; depth=0 }
     /^[[:space:]]*#/ { next }
     {
-        line = $0
-        gsub(/#.*$/, "", line)          # supprimer commentaires inline
-        buf = buf " " $0                # conserver la ligne originale dans buf
+        line = $0; gsub(/#.*$/, "", line)
+        buf = buf " " $0
         for (i=1; i<=length(line); i++) {
             c = substr(line, i, 1)
             if (c == "(") depth++
             else if (c == ")") depth--
         }
         if (depth <= 0 && buf ~ /[^[:space:]]/) {
-            print buf
-            buf = ""; depth = 0
+            print buf; buf = ""; depth = 0
         }
     }
     END { if (buf ~ /[^[:space:]]/) print buf }
-    ' "$comm_file" 2>/dev/null)
+    ' "$1" 2>/dev/null
+}
 
-    # ── Analyse de chaque bloc aplati ──────────────────────────────
+_parse_comm_outputs() {
+    local comm_file="$1"
+    _COMM_OUTPUTS=()
+    local flat
+    flat=$(_flatten_comm "$comm_file")
+
     while IFS= read -r block; do
         [ -z "$block" ] && continue
-
-        # Extraire UNITE=N (accepte espaces autour du '=')
         local unite
         unite=$(echo "$block" | sed -n 's/.*UNITE[[:space:]]*=[[:space:]]*\([0-9]\+\).*/\1/p' | head -1)
         [ -z "$unite" ] && continue
-
-        # Ignorer les unités standard déjà déclarées dans le .export par défaut
         case "$unite" in 1|6|8|20|80) continue ;; esac
 
         local type label
         if echo "$block" | grep -q "IMPR_RESU"; then
             if echo "$block" | grep -qE "FORMAT[[:space:]]*=[[:space:]]*['\"]MED['\"]"; then
-                type="rmed"
-                label="IMPR_RESU FORMAT=MED    →  unite $unite  (.rmed)"
+                type="rmed"; label="IMPR_RESU FORMAT=MED    →  unite $unite  (.rmed)"
             else
-                type="resu"
-                label="IMPR_RESU              →  unite $unite  (.resu)"
+                type="resu"; label="IMPR_RESU              →  unite $unite  (.resu)"
             fi
         elif echo "$block" | grep -q "IMPR_TABLE"; then
-            type="table"
-            label="IMPR_TABLE             →  unite $unite  (.table)"
+            type="table"; label="IMPR_TABLE             →  unite $unite  (.table)"
         elif echo "$block" | grep -q "DEFI_FICHIER"; then
-            # Tenter d'extraire l'extension depuis le nom de fichier déclaré
             local ext
             ext=$(echo "$block" | sed -n "s/.*FICHIER[[:space:]]*=[[:space:]]*['\"][^'\"]*\.\([a-zA-Z0-9]*\)['\"].*/\1/p" | head -1)
-            type="${ext:-dat}"
-            label="DEFI_FICHIER           →  unite $unite${ext:+  (.$ext)}"
+            type="${ext:-dat}"; label="DEFI_FICHIER           →  unite $unite${ext:+  (.$ext)}"
         else
             continue
         fi
-
         _COMM_OUTPUTS+=("${label}|${type}|${unite}")
     done <<< "$flat"
 }
 
+# ──────────────────────────────────────────────────────────────────────
+#  _validate_comm : validation de coherence .comm / fichiers / options
+#
+#  Detecte AVANT soumission les erreurs classiques qui font planter
+#  le calcul sur le noeud de calcul (perte de temps + quota scratch).
+#
+#  Controles effectues :
+#    1. LIRE_MAILLAGE : verifie qu'un fichier .med ou .mail est present
+#       si le .comm lit un maillage (UNITE=20 par defaut)
+#    2. IMPR_RESU / IMPR_TABLE / DEFI_FICHIER avec UNITE non standard :
+#       verifie que -R ou l'auto-detection les a declares
+#    3. INCLUDE : verifie que les fichiers inclus existent dans STUDY_DIR
+#    4. POURSUITE : avertit si aucune base n'est trouvee
+#    5. Fichiers .py importes : verifie leur presence
+#
+#  Retourne 0 si tout est OK, 1 si erreur bloquante.
+#  Les warnings ne bloquent pas la soumission.
+# ──────────────────────────────────────────────────────────────────────
+
+_validate_comm() {
+    local comm_file="$1"
+    local study_dir="$2"
+    local has_med="$3"    # non-vide si .med present
+    local has_mail="$4"   # non-vide si .mail present
+    local results="$5"    # chaine RESULTS courante (type:unite,...)
+    local errors=0
+
+    local flat
+    flat=$(_flatten_comm "$comm_file")
+
+    section "Validation du .comm"
+
+    # ── 1. Maillage requis ? ──────────────────────────────────────
+    if echo "$flat" | grep -q "LIRE_MAILLAGE"; then
+        if [ -z "$has_med" ] && [ -z "$has_mail" ]; then
+            err "Le .comm contient LIRE_MAILLAGE mais aucun fichier .med ou .mail n'est present"
+            errors=$((errors + 1))
+        else
+            ok "LIRE_MAILLAGE : maillage detecte"
+        fi
+    fi
+
+    # ── 2. POURSUITE sans base ────────────────────────────────────
+    if echo "$flat" | grep -q "POURSUITE"; then
+        local has_base=0
+        shopt -s nullglob
+        local -a bases=("${study_dir}"/glob.* "${study_dir}"/pick.*)
+        shopt -u nullglob
+        [ ${#bases[@]} -gt 0 ] && has_base=1
+        if [ "$has_base" -eq 0 ]; then
+            warn "Le .comm contient POURSUITE mais aucune base (glob.*/pick.*) trouvee dans $study_dir"
+            warn "  → Le calcul va probablement echouer. Utilisez -B pour specifier le dossier base."
+        else
+            ok "POURSUITE : base trouvee (${#bases[@]} fichiers)"
+        fi
+    fi
+
+    # ── 3. UNITE non standard non declarees ───────────────────────
+    # Extraire toutes les UNITE du .comm (hors standard 1,6,8,20,80)
+    local -a all_unites=()
+    while IFS= read -r block; do
+        [ -z "$block" ] && continue
+        local u
+        u=$(echo "$block" | sed -n 's/.*UNITE[[:space:]]*=[[:space:]]*\([0-9]\+\).*/\1/p' | head -1)
+        [ -z "$u" ] && continue
+        case "$u" in 1|6|8|20|80) continue ;; esac
+        # Verifier si c'est une sortie (IMPR_RESU, IMPR_TABLE, DEFI_FICHIER)
+        if echo "$block" | grep -qE "IMPR_RESU|IMPR_TABLE|DEFI_FICHIER"; then
+            all_unites+=("$u")
+        fi
+    done <<< "$flat"
+
+    # Verifier que chaque UNITE est declaree dans RESULTS
+    local declared_unites=""
+    if [ -n "$results" ]; then
+        declared_unites=$(echo "$results" | tr ',' '\n' | sed 's/.*://')
+    fi
+
+    local missing_unites=()
+    for u in "${all_unites[@]}"; do
+        if ! echo "$declared_unites" | grep -qw "$u"; then
+            missing_unites+=("$u")
+        fi
+    done
+
+    if [ ${#missing_unites[@]} -gt 0 ]; then
+        warn "UNITE de sortie dans le .comm non declarees dans le .export :"
+        for u in "${missing_unites[@]}"; do
+            warn "  → UNITE=$u  (pas de ligne F ... R $u dans le .export)"
+        done
+        warn "Ces fichiers de sortie seront perdus apres le calcul !"
+        warn "  Correction : ajoutez -R \"type:unite\" (ex: -R \"rmed:$u\")"
+        warn "  Ou utilisez le mode interactif pour les selectionner."
+    elif [ ${#all_unites[@]} -gt 0 ]; then
+        ok "Toutes les UNITE de sortie (${all_unites[*]}) sont declarees"
+    fi
+
+    # ── 4. INCLUDE : fichiers presents ? ──────────────────────────
+    local includes
+    includes=$(echo "$flat" | grep -oP "INCLUDE\s*\(.*?DONNEE\s*=\s*['\"]([^'\"]+)['\"]" | \
+               sed -n "s/.*['\"]\\([^'\"]*\\)['\"].*/\\1/p" 2>/dev/null || true)
+    while IFS= read -r inc; do
+        [ -z "$inc" ] && continue
+        if [ ! -f "${study_dir}/${inc}" ]; then
+            warn "INCLUDE reference '${inc}' — fichier absent de ${study_dir}"
+        else
+            ok "INCLUDE : ${inc} present"
+        fi
+    done <<< "$includes"
+
+    # ── 5. Imports Python (.py) ───────────────────────────────────
+    local py_imports
+    py_imports=$(grep -oP "^\s*(?:from|import)\s+(\w+)" "$comm_file" 2>/dev/null | \
+                 awk '{print $NF}' | sort -u || true)
+    while IFS= read -r mod; do
+        [ -z "$mod" ] && continue
+        # Ignorer les modules standard Python et Code_Aster
+        case "$mod" in
+            os|sys|math|numpy|np|json|re|time|datetime|glob|shutil|pathlib) continue ;;
+            code_aster|Cata|Macro|Comportement|Utilitai*) continue ;;
+        esac
+        if [ -f "${study_dir}/${mod}.py" ]; then
+            ok "Import Python : ${mod}.py present"
+        fi
+        # On ne warn pas pour les imports inconnus (trop de faux positifs)
+    done <<< "$py_imports"
+
+    # ── 6. Verif rapide : DEBUT ou POURSUITE present ──────────────
+    if ! echo "$flat" | grep -qE "^\s*(DEBUT|POURSUITE)\s*\("; then
+        warn "Ni DEBUT() ni POURSUITE() trouve dans le .comm — fichier incomplet ?"
+    fi
+
+    if ! echo "$flat" | grep -qE "^\s*FIN\s*\(\s*\)"; then
+        warn "FIN() absent du .comm — le calcul risque de ne pas terminer proprement"
+    fi
+
+    [ "$errors" -gt 0 ] && return 1
+    return 0
+}
+
+# ──────────────────────────────────────────────────────────────────────
+#  _auto_detect_results : analyse le .comm et ajoute automatiquement
+#  les UNITE de sortie manquantes dans RESULTS.
+#
+#  Appele en mode CLI (non-interactif) pour eviter les oublis de -R.
+# ──────────────────────────────────────────────────────────────────────
+
+_auto_detect_results() {
+    local comm_file="$1"
+    _parse_comm_outputs "$comm_file"
+
+    [ ${#_COMM_OUTPUTS[@]} -eq 0 ] && return
+
+    local auto_results=""
+    for item in "${_COMM_OUTPUTS[@]}"; do
+        local _type="${item#*|}"; _type="${_type%%|*}"
+        local _unite="${item##*|}"
+        # Verifier si deja dans RESULTS
+        if [ -n "$RESULTS" ] && echo "$RESULTS" | grep -q ":${_unite}"; then
+            continue
+        fi
+        [ -n "$auto_results" ] && auto_results+=","
+        auto_results+="${_type}:${_unite}"
+    done
+
+    if [ -n "$auto_results" ]; then
+        if [ -n "$RESULTS" ]; then
+            RESULTS="${RESULTS},${auto_results}"
+        else
+            RESULTS="$auto_results"
+        fi
+        info "Auto-detection des sorties du .comm : $auto_results"
+    fi
+}
+
 # ══════════════════════════════════════════
-#  _verif_chemin : demande correction si le dossier $2 n'existe pas
-#    $1 = nom de la variable (pour le message)
-#    $2 = valeur actuelle du chemin
-#  Résultat : _SAISIE contient le nouveau chemin (ou l'ancien si correct)
+#  MODE INTERACTIF
 # ══════════════════════════════════════════
+
 _verif_chemin() {
     local nom="$1" chemin="$2"
     [ -d "$chemin" ] && { _SAISIE="$chemin"; return; }
@@ -350,16 +445,9 @@ _verif_chemin() {
     warn "$nom = $chemin  (dossier absent)"
     saisir "Nouveau chemin $nom" "$chemin"
     [ -d "$_SAISIE" ] && ok "$nom : $_SAISIE" \
-                      || warn "Dossier toujours absent — le calcul peut échouer"
+                      || warn "Dossier toujours absent — le calcul peut echouer"
 }
 
-# ══════════════════════════════════════════
-#  MODE INTERACTIF
-#  Lance un wizard de configuration quand le script est appelé sans argument.
-#  Remplit les mêmes variables que le parsing CLI :
-#    STUDY_DIR, PARTITION, NODES, NTASKS, CPUS, MEM, TIME_LIMIT,
-#    FOLLOW, KEEP_SCRATCH, DRY_RUN
-# ══════════════════════════════════════════
 mode_interactif() {
     printf "\n${CYAN}${BOLD}" >/dev/tty
     printf "  ╔══════════════════════════════════════════╗\n" >/dev/tty
@@ -368,21 +456,15 @@ mode_interactif() {
     printf "  ╚══════════════════════════════════════════╝\n" >/dev/tty
     printf "${NC}\n" >/dev/tty
 
-    # ── 0. Correction des chemins manquants ───────────────────────────────
-    # On ne demande que si le chemin n'existe pas ; s'il existe on ne dérange pas.
     _verif_chemin "ASTER_ROOT"   "$ASTER_ROOT";   ASTER_ROOT="$_SAISIE"
     _verif_chemin "SCRATCH_BASE" "$SCRATCH_BASE"; SCRATCH_BASE="$_SAISIE"
 
-    # ── 1. Dossier d'étude ────────────────────────────────────────────────
+    # ── Dossier d'etude ───────────────────────────────────────────
     section "Dossier d'étude"
-
-    # Cherche les dossiers contenant au moins un .comm (max 2 niveaux)
-    local -a dossiers=()
-    local d
-    while IFS= read -r d; do
-        dossiers+=("$d")
-    done < <(find . -maxdepth 2 -name "*.comm" -printf '%h\n' 2>/dev/null \
-             | sort -u | sed 's|^\./\?||;/^$/d')
+    local -a dossiers=(); local d
+    while IFS= read -r d; do dossiers+=("$d"); done < <(
+        find . -maxdepth 2 -name "*.comm" -printf '%h\n' 2>/dev/null | sort -u | sed 's|^\./\?||;/^$/d'
+    )
     [ ${#dossiers[@]} -eq 0 ] && dossiers=(".")
 
     if [ ${#dossiers[@]} -gt 1 ]; then
@@ -395,13 +477,10 @@ mode_interactif() {
     fi
     ok "Dossier : $STUDY_DIR"
 
-    # ── 1b. Sélection des sorties (lecture du .comm) ──────────────────────
+    # ── Sorties du calcul ─────────────────────────────────────────
     section "Sorties du calcul"
-    # Chercher le premier .comm dans le dossier sélectionné
-    local _comm_found=""
-    local -a _comm_arr=()
-    shopt -s nullglob; _comm_arr=("${STUDY_DIR}"/*.comm); shopt -u nullglob
-    [ ${#_comm_arr[@]} -ge 1 ] && _comm_found="${_comm_arr[0]}"
+    local _comm_found
+    _comm_found=$(_find_first "$STUDY_DIR" "*.comm")
 
     if [ -n "$_comm_found" ]; then
         info "Lecture : $(basename "$_comm_found")"
@@ -409,93 +488,74 @@ mode_interactif() {
     fi
 
     if [ ${#_COMM_OUTPUTS[@]} -gt 0 ]; then
-        # Construire le tableau de labels pour le menu
         local -a _labels=()
-        local _item
-        for _item in "${_COMM_OUTPUTS[@]}"; do
-            _labels+=("${_item%%|*}")
-        done
+        for _item in "${_COMM_OUTPUTS[@]}"; do _labels+=("${_item%%|*}"); done
         menu_cases "Sorties supplémentaires à inclure :" "${_labels[@]}"
 
-        # Construire RESULTS à partir de la sélection
         local _sel_results="" _idx
         for _idx in "${_MENU_ITEMS[@]}"; do
             _item="${_COMM_OUTPUTS[$_idx]}"
-            local _type="${_item#*|}"    # supprimer label|
-            _type="${_type%%|*}"         # garder type (avant dernier |)
-            local _unite="${_item##*|}"  # après le dernier |
+            local _type="${_item#*|}"; _type="${_type%%|*}"
+            local _unite="${_item##*|}"
             [ -n "$_sel_results" ] && _sel_results+=","
             _sel_results+="${_type}:${_unite}"
         done
         [ -n "$_sel_results" ] && RESULTS="$_sel_results"
     else
-        [ -n "$_comm_found" ] && \
-            info "Aucune sortie supplémentaire détectée dans le .comm"
+        [ -n "$_comm_found" ] && info "Aucune sortie supplémentaire détectée dans le .comm"
         info "Les sorties par défaut seront générées (.mess, .resu, .rmed unite 80)"
     fi
 
-    # ── 2. Preset de ressources ───────────────────────────────────────────
+    # ── Preset de ressources ──────────────────────────────────────
     section "Ressources Slurm"
     menu_fleches "Preset de ressources :" \
-        "court   — partition:${PRESET_COURT_PARTITION}  tâches:${PRESET_COURT_NTASKS}  mém:${PRESET_COURT_MEM}  durée:${PRESET_COURT_TIME}" \
-        "moyen   — partition:${PRESET_MOYEN_PARTITION}  tâches:${PRESET_MOYEN_NTASKS}  mém:${PRESET_MOYEN_MEM}  durée:${PRESET_MOYEN_TIME}" \
-        "long    — partition:${PRESET_LONG_PARTITION}   tâches:${PRESET_LONG_NTASKS}   mém:${PRESET_LONG_MEM}   durée:${PRESET_LONG_TIME}" \
+        "court   — ${PRESET_PARTITION[court]}  ${PRESET_MEM[court]}  ${PRESET_TIME[court]}" \
+        "moyen   — ${PRESET_PARTITION[moyen]}  ${PRESET_MEM[moyen]}  ${PRESET_TIME[moyen]}" \
+        "long    — ${PRESET_PARTITION[long]}   ${PRESET_MEM[long]}   ${PRESET_TIME[long]}" \
         "Manuel  — saisir les valeurs"
     [ "$_MENU_IDX" -eq -1 ] && { warn "Annulé."; exit 0; }
 
-    case "$_MENU_IDX" in
-        0)  PARTITION="$PRESET_COURT_PARTITION"; NTASKS="$PRESET_COURT_NTASKS"
-            MEM="$PRESET_COURT_MEM";             TIME_LIMIT="$PRESET_COURT_TIME" ;;
-        1)  PARTITION="$PRESET_MOYEN_PARTITION"; NTASKS="$PRESET_MOYEN_NTASKS"
-            MEM="$PRESET_MOYEN_MEM";             TIME_LIMIT="$PRESET_MOYEN_TIME" ;;
-        2)  PARTITION="$PRESET_LONG_PARTITION";  NTASKS="$PRESET_LONG_NTASKS"
-            MEM="$PRESET_LONG_MEM";              TIME_LIMIT="$PRESET_LONG_TIME"  ;;
-        3)  saisir "Partition"         "$DEFAULT_PARTITION"; PARTITION="$_SAISIE"
-            saisir "Nb nœuds"          "$DEFAULT_NODES";     NODES="$_SAISIE"
-            saisir "Nb tâches MPI"     "$DEFAULT_NTASKS";    NTASKS="$_SAISIE"
-            saisir "CPUs par tâche"    "$DEFAULT_CPUS";      CPUS="$_SAISIE"
-            saisir "Mémoire (ex: 8G)"  "$DEFAULT_MEM";       MEM="$_SAISIE"
-            saisir "Durée max"         "$DEFAULT_TIME";       TIME_LIMIT="$_SAISIE" ;;
-    esac
-    # Empêcher la re-application du preset par le code de parsing
+    local _presets=(court moyen long)
+    if [ "$_MENU_IDX" -lt 3 ]; then
+        local _p="${_presets[$_MENU_IDX]}"
+        PARTITION="${PRESET_PARTITION[$_p]}"; NTASKS="${PRESET_NTASKS[$_p]}"
+        MEM="${PRESET_MEM[$_p]}"; TIME_LIMIT="${PRESET_TIME[$_p]}"
+    else
+        saisir "Partition"       "$DEFAULT_PARTITION"; PARTITION="$_SAISIE"
+        saisir "Nb nœuds"        "$DEFAULT_NODES";     NODES="$_SAISIE"
+        saisir "Nb tâches MPI"   "$DEFAULT_NTASKS";    NTASKS="$_SAISIE"
+        saisir "CPUs par tâche"  "$DEFAULT_CPUS";      CPUS="$_SAISIE"
+        saisir "Mémoire (ex: 8G)" "$DEFAULT_MEM";      MEM="$_SAISIE"
+        saisir "Durée max"       "$DEFAULT_TIME";       TIME_LIMIT="$_SAISIE"
+    fi
     PRESET=""
 
-    # ── 3. Options ────────────────────────────────────────────────────────
+    # ── Options ───────────────────────────────────────────────────
     section "Options"
     menu_cases "Options :" \
         "Suivre le job en temps réel (--follow)" \
         "Conserver le scratch après le calcul (--keep-scratch)" \
-        "Dry-run — afficher la commande sans soumettre (--dry-run)"
+        "Dry-run — afficher sans soumettre (--dry-run)"
 
-    local idx
     for idx in "${_MENU_ITEMS[@]}"; do
-        case "$idx" in
-            0) FOLLOW=1       ;;
-            1) KEEP_SCRATCH=1 ;;
-            2) DRY_RUN=1      ;;
-        esac
+        case "$idx" in 0) FOLLOW=1 ;; 1) KEEP_SCRATCH=1 ;; 2) DRY_RUN=1 ;; esac
     done
 
-    # ── 4. Récapitulatif + confirmation ───────────────────────────────────
+    # ── Récapitulatif ─────────────────────────────────────────────
     section "Récapitulatif"
     info "Dossier   : $STUDY_DIR"
-    info "Partition : ${PARTITION:-$DEFAULT_PARTITION}  Nœuds : ${NODES:-$DEFAULT_NODES}  Tâches : ${NTASKS:-$DEFAULT_NTASKS}  CPUs : ${CPUS:-$DEFAULT_CPUS}"
+    info "Partition : ${PARTITION:-$DEFAULT_PARTITION}  Tâches : ${NTASKS:-$DEFAULT_NTASKS}"
     info "Mémoire   : ${MEM:-$DEFAULT_MEM}  |  Durée : ${TIME_LIMIT:-$DEFAULT_TIME}"
     [ "$FOLLOW"       = "1" ] && info "Option    : --follow"
     [ "$KEEP_SCRATCH" = "1" ] && info "Option    : --keep-scratch"
     [ "$DRY_RUN"      = "1" ] && info "Option    : --dry-run"
 
-    menu_fleches "Confirmer ?" \
-        "Soumettre le calcul" \
-        "Annuler"
+    menu_fleches "Confirmer ?" "Soumettre le calcul" "Annuler"
     [ "$_MENU_IDX" -ne 0 ] && { warn "Annulé."; exit 0; }
 }
 
 # ══════════════════════════════════════════
-#  AIDE EN LIGNE
-#  Affichee par -h / --help, puis le script quitte (exit 0).
-#  Le heredoc <<'EOF' (guillemets autour de EOF) desactive l'expansion
-#  des variables a l'interieur, ce qui permet d'ecrire $ sans echappement.
+#  AIDE
 # ══════════════════════════════════════════
 
 usage() {
@@ -509,26 +569,24 @@ FICHIERS
   -A, --mail FILE       Fichier .mail (auto-detecte si absent)
 
 RESULTATS SUPPLEMENTAIRES
-  -R, --results LIST    Format "type:unite,..." (ex: "rmed:81, csv:38")
+  -R, --results LIST    Format "type:unite,..." (ex: "rmed:81,csv:38")
+                        Si omis, les UNITE sont auto-detectees du .comm
 
 RESSOURCES SLURM
   -P, --preset  NOM     court, moyen ou long
-  -p, --partition NOM   Partition Slurm (ex: court, normal, long)
+  -p, --partition NOM   Partition Slurm
   -n, --nodes N         Nombre de noeuds
   -t, --ntasks N        Taches MPI
   -c, --cpus N          CPUs par tache
   -m, --mem MEM         Memoire (ex: 8G)
-  -T, --time DUREE      Duree max (J-HH:MM:SS, HH:MM:SS, MM:SS)
+  -T, --time DUREE      Duree max (J-HH:MM:SS)
 
 OPTIONS
-  -q, --quiet           Sortie minimale
-  -f, --follow          Suivre le job apres soumission :
-                          · Spinner avec l'etat Slurm (PENDING/CONFIGURING)
-                          · tail -f automatique des le passage en RUNNING
-                          · Bilan (alarmes/erreurs) a la fin du job
-                          · Ctrl+C detache sans annuler le calcul
+  -q, --quiet           Sortie minimale (juste le JOB ID)
+  -f, --follow          Suivre le job apres soumission
       --keep-scratch    Ne pas supprimer le scratch
       --dry-run         Afficher sans lancer
+      --no-validate     Desactiver la validation du .comm
       --debug           Mode verbose (set -x)
   -h, --help            Afficher cette aide
 EOF
@@ -539,125 +597,56 @@ EOF
 #
 #   PHASE 2 — NOEUD DE CALCUL
 #
-#   Ce bloc est execute UNIQUEMENT quand sbatch relance ce script avec
-#   la variable __RUN_PHASE=EXEC dans son environnement (transmise via
-#   sbatch --export). Sur le noeud login, cette variable est absente,
-#   donc le bloc est saute et on tombe directement en Phase 1.
-#
 # ##########################################################################
 
 if [ "${__RUN_PHASE:-}" = "EXEC" ]; then
 
-    # set -uo pipefail : mode strict
-    #   -u : erreur si variable non definie (evite les bugs silencieux)
-    #   -o pipefail : echec du pipe si l'une des commandes echoue
-    # set -x est active plus bas uniquement si --debug a ete passe.
     set -uo pipefail
     [ "${__DEBUG:-0}" = "1" ] && set -x
-
-    # Verrou anti-double-rapatriement : collect_results peut etre appelee
-    # a la fois par le trap EXIT et explicitement en fin de script.
-    # Ce drapeau garantit qu'elle ne s'execute qu'une seule fois.
     ALREADY_COLLECTED=0
 
-    # ─────────────────────────────────────────────────────────────────
-    # _cp : helper de copie portable
-    #   Utilise rsync -a si disponible (meilleur pour les gros fichiers :
-    #   delta I/O, reprise sur erreur reseau), sinon cp -a comme fallback.
-    #   rsync -a = archive mode : preserve permissions, timestamps, liens
-    #   symboliques, et copie recursivement les dossiers.
-    # ─────────────────────────────────────────────────────────────────
-    _cp() {
-        if command -v rsync &>/dev/null; then
-            rsync -a "$@"
-        else
-            cp -a "$@"
-        fi
-    }
-
-    # ─────────────────────────────────────────────────────────────────
-    # _log_dir : affiche le contenu d'un répertoire ligne par ligne via log()
-    # ─────────────────────────────────────────────────────────────────
+    _cp() { if command -v rsync &>/dev/null; then rsync -a "$@"; else cp -a "$@"; fi; }
     _log_dir() { ls -la "$1" 2>/dev/null | while IFS= read -r l; do log "  $l"; done; }
 
-    # ─────────────────────────────────────────────────────────────────
-    # collect_results : rapatrie les resultats du scratch vers le dossier
-    # d'etude et nettoie le scratch.
-    #
-    # Cette fonction est enregistree comme trap EXIT et SIGTERM, ce qui
-    # garantit qu'elle s'execute meme en cas de :
-    #   - fin normale du script
-    #   - scancel (Slurm envoie SIGTERM avant de tuer le job)
-    #   - timeout (Slurm envoie SIGTERM a l'expiration du --time)
-    #
-    # Structure du dossier de destination :
-    #   $STUDY_DIR/run_$JOBID/          <- resultats du calcul
-    #   $STUDY_DIR/latest -> run_$JOBID <- lien symbolique vers le dernier run
-    # ─────────────────────────────────────────────────────────────────
     collect_results() {
-        [ "$ALREADY_COLLECTED" -eq 1 ] && return   # ne s'execute qu'une fois
+        [ "$ALREADY_COLLECTED" -eq 1 ] && return
         ALREADY_COLLECTED=1
-
         header "RAPATRIEMENT"
 
-        # Dossier de destination unique par job ID, pour eviter tout ecrasement
-        # si plusieurs jobs tournent depuis le meme dossier d'etude.
         local dest="${__STUDY_DIR}/run_${SLURM_JOB_ID}"
         mkdir -p "$dest" || { log "!! Impossible de creer $dest"; return; }
+        local count=0
 
-        local count=0   # compteur de fichiers rapatries (informatif)
-
-        # --- Debug : lister tout ce qu'il y a dans le scratch ---
-        log "Fichiers presents dans le scratch :"
+        log "Fichiers dans le scratch :"
         _log_dir "${__SCRATCH}/"
-        log ""
 
-        # --- Resultats classiques ---
-        # On parcourt toutes les extensions de fichiers que Code_Aster peut produire.
-        # nullglob : si aucun fichier ne correspond au glob, la boucle est vide
-        # (au lieu d'iterer sur la chaine litterale du glob).
-        # _copy_file_if_exists : copie $1 vers $dest si non vide, incrémente count
-        _copy_file_if_exists() {
+        _copy_if_exists() {
             local f="$1"
             [ -f "$f" ] && [ -s "$f" ] || return 0
-            _cp "$f" "$dest/" && log "  -> $(basename "$f")" || log "  !! ECHEC copie : $(basename "$f")"
+            _cp "$f" "$dest/" && log "  -> $(basename "$f")" || log "  !! ECHEC : $(basename "$f")"
             count=$((count + 1))
         }
 
         shopt -s nullglob
         for ext in mess resu med csv table dat pos rmed txt vtu vtk py base; do
-            for f in "${__SCRATCH}"/*."${ext}"; do _copy_file_if_exists "$f"; done
+            for f in "${__SCRATCH}"/*."${ext}"; do _copy_if_exists "$f"; done
         done
         for f in "${__SCRATCH}"/glob.* "${__SCRATCH}"/pick.* "${__SCRATCH}"/vola.*; do
-            _copy_file_if_exists "$f"
+            _copy_if_exists "$f"
         done
         shopt -u nullglob
 
-        # --- Repertoire REPE_OUT ---
-        # Code_Aster peut ecrire dans REPE_OUT via des commandes comme IMPR_RESU
-        # avec un repertoire de sortie libre. On le rapatrie entierement si present.
         if [ -d "${__SCRATCH}/REPE_OUT" ]; then
-            _cp "${__SCRATCH}/REPE_OUT" "$dest/" && log "  -> REPE_OUT/" || log "  !! ECHEC copie REPE_OUT"
+            _cp "${__SCRATCH}/REPE_OUT" "$dest/" && log "  -> REPE_OUT/"
             count=$((count + 1))
         fi
 
-        # --- Lien symbolique "latest" ---
-        # Pointe toujours vers le dossier du dernier job termine,
-        # pour acceder facilement aux resultats sans connaitre le JOBID :
-        #   ls $STUDY_DIR/latest/
         rm -f "${__STUDY_DIR}/latest" 2>/dev/null
         ln -s "run_${SLURM_JOB_ID}" "${__STUDY_DIR}/latest" 2>/dev/null
 
-        log ""
         log "$count fichier(s) rapatrie(s) -> $dest"
-
-        # --- Contenu final du dossier destination ---
-        log "Contenu de $dest :"
         _log_dir "$dest/"
 
-        # --- Nettoyage du scratch ---
-        # Sauf si --keep-scratch a ete demande (utile pour deboguer un calcul
-        # qui a plante : on peut inspecter l'etat du scratch apres le job).
         if [ "${__KEEP_SCRATCH:-0}" != "1" ]; then
             rm -rf "$__SCRATCH" 2>/dev/null && log "Scratch supprime"
         else
@@ -665,36 +654,16 @@ if [ "${__RUN_PHASE:-}" = "EXEC" ]; then
         fi
     }
 
-    # Enregistrement des traps :
-    #   EXIT    : s'execute a toute sortie du script (normale ou erreur)
-    #   SIGTERM : envoye par Slurm lors d'un scancel ou d'un timeout
-    #             -> on rapatrie avant que Slurm ne force la terminaison
     trap collect_results EXIT
-    trap 'collect_results; exit 143' SIGTERM   # 143 = 128 + 15 (SIGTERM)
+    trap 'collect_results; exit 143' SIGTERM
 
-    # ─────────────────────────────────────────────────────────────────
-    # En-tete de log : informations contextuelles du job Slurm.
-    # Les variables SLURM_* sont injectees automatiquement par Slurm.
-    # Les variables __* ont ete transmises depuis la Phase 1 via --export.
-    # ─────────────────────────────────────────────────────────────────
+    # ── En-tete ───────────────────────────────────────────────────
     header "CODE_ASTER — $(date)"
     log "Job       : $SLURM_JOB_ID"
     log "Noeud     : $SLURM_NODELIST"
     log "Scratch   : $__SCRATCH"
 
-    # ─────────────────────────────────────────────────────────────────
-    # Chargement du module Code_Aster
-    #
-    # Probleme : en environnement batch non-interactif, /etc/profile et
-    # les scripts profile.d ne sont pas sources automatiquement, donc la
-    # commande "module" (fournie par Lmod ou Environment Modules) peut
-    # etre absente du PATH.
-    #
-    # Solution : on tente de sourcer manuellement le script d'init du
-    # gestionnaire de modules avant d'appeler "module load".
-    # On essaie modules.sh (Environment Modules) puis lmod.sh (Lmod).
-    # Le "break" sort de la boucle des qu'un sourcing reussit.
-    # ─────────────────────────────────────────────────────────────────
+    # ── Chargement module ─────────────────────────────────────────
     if [ -n "${__MODULE:-}" ]; then
         if ! command -v module &>/dev/null; then
             for _mfile in /etc/profile.d/modules.sh /etc/profile.d/lmod.sh; do
@@ -702,29 +671,13 @@ if [ "${__RUN_PHASE:-}" = "EXEC" ]; then
             done
         fi
         if command -v module &>/dev/null; then
-            # "2>&1" redirige les messages du module vers stdout pour qu'ils
-            # apparaissent dans le log du job (aster_JOBID.out).
-            module load "$__MODULE" 2>&1 \
-                && log "Module '$__MODULE' charge" \
-                || warn "Module '$__MODULE' echec"
+            module load "$__MODULE" 2>&1 && log "Module '$__MODULE' charge" || warn "Module '$__MODULE' echec"
         else
-            warn "Commande module introuvable apres sourcing — module non charge"
+            warn "Commande module introuvable"
         fi
     fi
 
-    # ─────────────────────────────────────────────────────────────────
-    # Recherche de l'executable Code_Aster
-    #
-    # On cherche dans l'ordre :
-    #   1. $ASTER_ROOT/bin/run_aster  (installation standard recente)
-    #   2. $ASTER_ROOT/bin/as_run     (ancienne denomination)
-    #   3. run_aster dans le PATH     (module charge ou installation custom)
-    #   4. as_run dans le PATH
-    #
-    # "command -v" retourne le chemin de l'executable ou rien si absent.
-    # "|| true" empeche un exit en cas d'echec sous set -e.
-    # On boucle et on prend le premier executable valide trouve.
-    # ─────────────────────────────────────────────────────────────────
+    # ── Executable Code_Aster ─────────────────────────────────────
     EXE=""
     for c in "${__ASTER_ROOT}/bin/run_aster" \
              "${__ASTER_ROOT}/bin/as_run" \
@@ -734,65 +687,24 @@ if [ "${__RUN_PHASE:-}" = "EXEC" ]; then
     done
     [ -z "$EXE" ] && { err "Code_Aster introuvable"; exit 1; }
     log "Executable : $EXE"
-    # Affiche la version dans le log (head -1 pour ne garder que la premiere ligne)
     "$EXE" --version 2>&1 | head -1 | while read -r l; do log "Version : $l"; done
 
-    # ─────────────────────────────────────────────────────────────────
-    # Verification pre-calcul : affiche le contenu du scratch et du .export
-    # dans le log pour faciliter le diagnostic en cas de probleme.
-    # ─────────────────────────────────────────────────────────────────
+    # ── Verification ──────────────────────────────────────────────
     header "VERIFICATION"
-    log "Contenu scratch :"
-    _log_dir "$__SCRATCH/"
-    log ""
+    log "Contenu scratch :"; _log_dir "$__SCRATCH/"
     log "Contenu .export :"
-    # "while IFS= read -r l" preserve les espaces en debut de ligne et les
-    # backslashes, contrairement a un simple "while read".
     cat "$__EXPORT" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
 
-    # ─────────────────────────────────────────────────────────────────
-    # Lancement du calcul
-    #
-    # set +e desactive temporairement l'arret sur erreur (set -e) pour
-    # capturer le code retour de run_aster sans que le script s'arrete.
-    # run_aster peut retourner un code non nul sans que ce soit fatal
-    # pour notre logique de rapatriement.
-    #
-    # IMPORTANT : on appelle run_aster directement, sans srun.
-    # run_aster/as_run gere lui-meme le lancement MPI (il appelle mpirun
-    # en interne selon la configuration du .export). Encapsuler dans srun
-    # provoquerait une double initialisation MPI (srun + mpirun interne)
-    # et des conflits entre les gestionnaires de processus Slurm et MPI.
-    # ─────────────────────────────────────────────────────────────────
+    # ── Calcul ────────────────────────────────────────────────────
     header "CALCUL"
     log "Lancement : $(date)"
-    RC=0
-    set +e
-    "$EXE" "$__EXPORT"
-    RC=$?
-    set -e
+    RC=0; set +e; "$EXE" "$__EXPORT"; RC=$?; set -e
     log "Termine : $(date) — code retour $RC"
 
-    # ─────────────────────────────────────────────────────────────────
-    # Diagnostic du fichier .mess
-    #
-    # Le fichier .mess est le journal de Code_Aster. Il contient :
-    #   <A> : alarmes (non bloquantes, a verifier)
-    #   <F> : erreurs fatales (arret du calcul)
-    #   <S> : exceptions (erreurs graves mais non fatales)
-    #
-    # grep -c compte le nombre d'occurrences. "|| true" empeche un exit
-    # si grep ne trouve rien (retourne 1).
-    # On affiche les 20 premieres lignes autour des erreurs pour le log.
-    # ─────────────────────────────────────────────────────────────────
-    # ─────────────────────────────────────────────────────────────────
-    # _diagnose_mess : analyse le fichier .mess et affiche le bilan
-    #   $1 = chemin du fichier .mess
-    #   Retourne 0 si succès, 1 si erreur fatale détectée
-    # ─────────────────────────────────────────────────────────────────
+    # ── Diagnostic .mess ──────────────────────────────────────────
     _diagnose_mess() {
         local mess_file="$1"
-        [ -f "$mess_file" ] || { log "!! Pas de .mess — le calcul n'a peut-être pas démarré"; return 1; }
+        [ -f "$mess_file" ] || { log "!! Pas de .mess"; return 1; }
         local na nf ns
         na=$(grep -c "<A>" "$mess_file" 2>/dev/null || true)
         nf=$(grep -c "<F>" "$mess_file" 2>/dev/null || true)
@@ -804,22 +716,15 @@ if [ "${__RUN_PHASE:-}" = "EXEC" ]; then
     }
 
     header "DIAGNOSTIC"
-    MESS="${__SCRATCH}/${__STUDY_NAME}.mess"
-    _diagnose_mess "$MESS" || _log_dir "$__SCRATCH/"
+    _diagnose_mess "${__SCRATCH}/${__STUDY_NAME}.mess" || _log_dir "$__SCRATCH/"
 
-    # Etat final du scratch (aide au debug)
-    log ""
     log "Contenu scratch apres calcul :"
     _log_dir "$__SCRATCH/"
 
-    # Rapatriement explicite (le trap EXIT le ferait aussi, mais on l'appelle
-    # ici pour avoir les logs dans l'ordre avant le header FIN).
     collect_results
-
     header "FIN"
     [ "$RC" -eq 0 ] && log "SUCCES" || log "ECHEC (code $RC)"
     log "Resultats : ${__STUDY_DIR}/run_${SLURM_JOB_ID}"
-
     exit $RC
 fi
 
@@ -827,167 +732,116 @@ fi
 #
 #   PHASE 1 — NOEUD LOGIN
 #
-#   Ce code n'est atteint que si __RUN_PHASE != "EXEC", c'est-a-dire
-#   lors de l'appel direct par l'utilisateur depuis le noeud login.
-#
 # ##########################################################################
 
-# ─────────────────────────────────────────────────────────────────
-# Initialisation des variables d'arguments
-# Toutes les variables sont initialisees a vide ou a leur valeur par
-# defaut pour eviter les erreurs "variable non definie" avec set -u.
-# NOTE : set -euo pipefail est active APRES le mode interactif pour
-#        eviter que les expressions arithmetiques bash (exit code 1
-#        quand le resultat vaut 0) ou les commandes tput ne tuent
-#        silencieusement le script.
-# ─────────────────────────────────────────────────────────────────
-STUDY_DIR="."
-COMM="" ; MED="" ; MAIL=""
-PRESET="" ; PARTITION="" ; NODES="" ; NTASKS="" ; CPUS="" ; MEM="" ; TIME_LIMIT=""
-QUIET=false ; RESULTS="" ; KEEP_SCRATCH=0 ; DRY_RUN=0 ; DEBUG=0 ; FOLLOW=0
-
-# Sauvegarder le nombre d'arguments AVANT la boucle de parsing
-# (les shift le consomment, donc $# vaut 0 après)
+STUDY_DIR="."; COMM=""; MED=""; MAIL=""
+PRESET=""; PARTITION=""; NODES=""; NTASKS=""; CPUS=""; MEM=""; TIME_LIMIT=""
+QUIET=false; RESULTS=""; KEEP_SCRATCH=0; DRY_RUN=0; DEBUG=0; FOLLOW=0
+NO_VALIDATE=0
 _NARGS=$#
 
-# ─────────────────────────────────────────────────────────────────
-# Parsing des arguments en ligne de commande
-#
-# On boucle tant qu'il reste des arguments ($# > 0).
-# "shift" consomme le premier argument ($1 devient l'ancien $2, etc.)
-# "shift 2" consomme l'option et sa valeur.
-# Le cas *) sans tiret est le DOSSIER_ETUDE positionnel.
-# ─────────────────────────────────────────────────────────────────
+# ── Parsing des arguments ─────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
-        -C|--comm)      COMM="$2";        shift 2 ;;   # Fichier .comm explicite
-        -M|--med)       MED="$2";         shift 2 ;;   # Maillage MED explicite
-        -A|--mail)      MAIL="$2";        shift 2 ;;   # Maillage ASTER natif explicite
-        -R|--results)   RESULTS="$2";     shift 2 ;;   # Sorties supplementaires "type:unite,..."
-        -P|--preset)    PRESET="$2";      shift 2 ;;   # Preset (court/moyen/long)
-        -p|--partition) PARTITION="$2";   shift 2 ;;   # Partition Slurm
-        -n|--nodes)     NODES="$2";       shift 2 ;;   # Nombre de noeuds
-        -t|--ntasks)    NTASKS="$2";      shift 2 ;;   # Nombre de taches MPI
-        -c|--cpus)      CPUS="$2";        shift 2 ;;   # CPUs par tache
-        -m|--mem)       MEM="$2";         shift 2 ;;   # Memoire (ex: 8G)
-        -T|--time)      TIME_LIMIT="$2";  shift 2 ;;   # Duree max
-        -q|--quiet)     QUIET=true;       shift ;;     # Mode silencieux (affiche seulement le JOB ID)
-        -f|--follow)    FOLLOW=1;         shift ;;     # Suivre le job apres soumission
-        --keep-scratch) KEEP_SCRATCH=1;   shift ;;     # Ne pas supprimer le scratch
-        --dry-run)      DRY_RUN=1;        shift ;;     # Afficher la commande sans la lancer
-        --debug)        DEBUG=1;          shift ;;     # Activer set -x en Phase 2
-        -h|--help)      usage ;;                       # Afficher l'aide et quitter
+        -C|--comm)      COMM="$2";        shift 2 ;;
+        -M|--med)       MED="$2";         shift 2 ;;
+        -A|--mail)      MAIL="$2";        shift 2 ;;
+        -R|--results)   RESULTS="$2";     shift 2 ;;
+        -P|--preset)    PRESET="$2";      shift 2 ;;
+        -p|--partition) PARTITION="$2";   shift 2 ;;
+        -n|--nodes)     NODES="$2";       shift 2 ;;
+        -t|--ntasks)    NTASKS="$2";      shift 2 ;;
+        -c|--cpus)      CPUS="$2";        shift 2 ;;
+        -m|--mem)       MEM="$2";         shift 2 ;;
+        -T|--time)      TIME_LIMIT="$2";  shift 2 ;;
+        -q|--quiet)     QUIET=true;       shift ;;
+        -f|--follow)    FOLLOW=1;         shift ;;
+        --keep-scratch) KEEP_SCRATCH=1;   shift ;;
+        --dry-run)      DRY_RUN=1;        shift ;;
+        --no-validate)  NO_VALIDATE=1;    shift ;;
+        --debug)        DEBUG=1;          shift ;;
+        -h|--help)      usage ;;
         -*)             err "Option inconnue : $1"; usage ;;
-        *)              STUDY_DIR="$1";   shift ;;     # Dossier d'etude (argument positionnel)
+        *)              STUDY_DIR="$1";   shift ;;
     esac
 done
 
-# ─────────────────────────────────────────────────────────────────
-# Application des presets
-#
-# ${PRESET,,} convertit en minuscules (bash 4+).
-# La syntaxe ": ${VAR:=valeur}" assigne valeur a VAR seulement si VAR
-# est vide ou non definie — cela permet aux options explicites passees
-# apres -P de prendre precedence sur les valeurs du preset.
-# Ex: -P moyen -t 8  -> utilise les valeurs de moyen SAUF ntasks=8
-# ─────────────────────────────────────────────────────────────────
-# ── Mode interactif : lancé si aucun argument n'a été fourni ─────────────────
-# IMPORTANT : mode_interactif doit être appelé AVANT set -euo pipefail car :
-#   - Les expressions arithmetiques bash ((i == sel)) retournent exit code 1
-#     quand le resultat vaut 0 (meme probleme que (( count++ )) avec count=0)
-#   - tput civis/cnorm peut echouer si TERM n'est pas bien defini
-#   - Sous set -e, n'importe laquelle de ces situations tue le script
-#     silencieusement sans message d'erreur
+# ── Mode interactif (avant set -euo pipefail) ────────────────
 [ "$_NARGS" -eq 0 ] && mode_interactif
 
-# set -euo pipefail : mode strict pour la Phase 1 (active APRES le mode interactif)
-#   -e : arret immediat si une commande echoue
-#   -u : erreur si variable non definie
-#   -o pipefail : echec du pipe si l'une des commandes echoue
 set -euo pipefail
 
+# ── Presets ───────────────────────────────────────────────────
 if [ -n "$PRESET" ]; then
-    case "${PRESET,,}" in
-        court|short)  : "${PARTITION:=$PRESET_COURT_PARTITION}"; : "${NTASKS:=$PRESET_COURT_NTASKS}"; : "${MEM:=$PRESET_COURT_MEM}"; : "${TIME_LIMIT:=$PRESET_COURT_TIME}" ;;
-        normal|medium) : "${PARTITION:=$PRESET_MOYEN_PARTITION}"; : "${NTASKS:=$PRESET_MOYEN_NTASKS}"; : "${MEM:=$PRESET_MOYEN_MEM}"; : "${TIME_LIMIT:=$PRESET_MOYEN_TIME}" ;;
-        long)         : "${PARTITION:=$PRESET_LONG_PARTITION}";  : "${NTASKS:=$PRESET_LONG_NTASKS}";  : "${MEM:=$PRESET_LONG_MEM}";  : "${TIME_LIMIT:=$PRESET_LONG_TIME}" ;;
+    local_preset="${PRESET,,}"
+    case "$local_preset" in
+        court|short)   local_preset="court" ;;
+        normal|medium) local_preset="moyen" ;;
+        long)          local_preset="long"  ;;
         *) err "Preset inconnu : $PRESET"; exit 1 ;;
     esac
+    : "${PARTITION:=${PRESET_PARTITION[$local_preset]}}"
+    : "${NTASKS:=${PRESET_NTASKS[$local_preset]}}"
+    : "${MEM:=${PRESET_MEM[$local_preset]}}"
+    : "${TIME_LIMIT:=${PRESET_TIME[$local_preset]}}"
     $QUIET || info "Preset : $PRESET"
 fi
-# Applique les valeurs par defaut pour tout ce qui est encore vide
+
 : "${PARTITION:=$DEFAULT_PARTITION}"; : "${NODES:=$DEFAULT_NODES}"
 : "${NTASKS:=$DEFAULT_NTASKS}"; : "${CPUS:=$DEFAULT_CPUS}"
 : "${MEM:=$DEFAULT_MEM}"; : "${TIME_LIMIT:=$DEFAULT_TIME}"
 
-# ─────────────────────────────────────────────────────────────────
-# Detection automatique des fichiers d'entree
-#
-# Pour chaque type de fichier, si l'utilisateur ne l'a pas specifie
-# explicitement avec -C/-M/-A, on cherche dans STUDY_DIR.
-# "shopt -s nullglob" : un glob sans correspondance retourne une liste
-#   vide plutot que la chaine litterale (ex: *.comm -> rien, pas "*.comm")
-# "shopt -u nullglob" : remet le comportement par defaut apres.
-# "realpath" resout les chemins relatifs en chemins absolus, ce qui
-# est necessaire car les chemins seront utilises depuis le scratch.
-# ─────────────────────────────────────────────────────────────────
+# ── Detection des fichiers ────────────────────────────────────
 $QUIET || section "Detection des fichiers"
 
 STUDY_DIR="$(realpath "$STUDY_DIR")"
-STUDY_NAME="$(basename "$STUDY_DIR")"   # Nom utilise pour nommer le job et les fichiers
+STUDY_NAME="$(basename "$STUDY_DIR")"
 [ -d "$STUDY_DIR" ] || { err "Dossier introuvable : $STUDY_DIR"; exit 1; }
 
-# Fichier .comm (obligatoire) : contient les commandes Code_Aster du calcul
+# .comm (obligatoire)
 if [ -z "$COMM" ]; then
-    shopt -s nullglob; arr=("$STUDY_DIR"/*.comm); shopt -u nullglob
-    [ ${#arr[@]} -eq 0 ] && { err "Aucun .comm dans $STUDY_DIR"; exit 1; }
-    [ ${#arr[@]} -gt 1 ] && warn "Plusieurs .comm, utilisation du premier"
-    COMM="${arr[0]}"
+    COMM=$(_find_first "$STUDY_DIR" "*.comm")
+    [ -z "$COMM" ] && { err "Aucun .comm dans $STUDY_DIR"; exit 1; }
 fi
 COMM="$(realpath "$COMM")"
 $QUIET || ok "Comm : $COMM"
 
-# Fichier .med (optionnel) : maillage au format MED (genere par Salome)
+# .med (optionnel)
 if [ -z "$MED" ]; then
-    shopt -s nullglob; arr=("$STUDY_DIR"/*.med); shopt -u nullglob
-    [ ${#arr[@]} -ge 1 ] && MED="${arr[0]}"
-    [ ${#arr[@]} -gt 1 ] && warn "Plusieurs .med, utilisation du premier"
+    MED=$(_find_first "$STUDY_DIR" "*.med" 2>/dev/null || true)
 fi
 [ -n "$MED" ] && { MED="$(realpath "$MED")"; $QUIET || ok "Med  : $MED"; }
 
-# Fichier .mail (optionnel) : maillage au format ASTER natif (texte)
+# .mail (optionnel)
 if [ -z "$MAIL" ]; then
-    shopt -s nullglob; arr=("$STUDY_DIR"/*.mail); shopt -u nullglob
-    [ ${#arr[@]} -ge 1 ] && MAIL="${arr[0]}"
+    MAIL=$(_find_first "$STUDY_DIR" "*.mail" 2>/dev/null || true)
 fi
 [ -n "$MAIL" ] && { MAIL="$(realpath "$MAIL")"; $QUIET || ok "Mail : $MAIL"; }
 
-# ─────────────────────────────────────────────────────────────────
-# Creation du dossier scratch
-#
-# Le scratch est un filesystem local ou NFS haute performance partage
-# entre le noeud login et les noeuds de calcul.
-# Le nom inclut : utilisateur / nom_etude_timestamp_PID
-#   - timestamp (date +%s) : secondes depuis epoch, assure l'unicite
-#   - $$ : PID du process courant, protection contre les lancements simultanees
-# ─────────────────────────────────────────────────────────────────
+# ── Auto-detection des UNITE de sortie du .comm ──────────────
+if [ -z "$RESULTS" ]; then
+    _auto_detect_results "$COMM"
+fi
+
+# ── Validation du .comm ──────────────────────────────────────
+if [ "$NO_VALIDATE" -eq 0 ] && ! $QUIET; then
+    if ! _validate_comm "$COMM" "$STUDY_DIR" "$MED" "$MAIL" "$RESULTS"; then
+        err "Validation du .comm echouee — corrigez les erreurs ci-dessus"
+        err "  Utilisez --no-validate pour forcer la soumission"
+        exit 1
+    fi
+fi
+
+# ── Preparation du scratch ────────────────────────────────────
 $QUIET || section "Preparation du scratch"
 SCRATCH="${SCRATCH_BASE}/${USER}/${STUDY_NAME}_$(date +%s)_$$"
 mkdir -p "$SCRATCH"
 $QUIET || ok "Scratch : $SCRATCH"
 
-# Copie des fichiers d'entree principaux dans le scratch.
-# Code_Aster travaille exclusivement dans le scratch ; les chemins du .export
-# pointeront vers ces copies (sauf pour la base et le rmed externe).
 cp "$COMM" "$SCRATCH/"
 [ -n "$MED" ]  && cp "$MED" "$SCRATCH/"
 [ -n "$MAIL" ] && cp "$MAIL" "$SCRATCH/"
 
-# Fichiers annexes : copies automatiquement si presents dans le dossier d'etude.
-# Utiles pour les calculs qui font appel a des modules Python (.py),
-# des parametres externes (.dat, .para), des inclusions (.include),
-# ou des lois de comportement MFront (.mfront).
-# "shopt -s nullglob" evite les erreurs si aucun fichier du type n'existe.
 shopt -s nullglob
 for f in "$STUDY_DIR"/*.py "$STUDY_DIR"/*.dat "$STUDY_DIR"/*.para \
          "$STUDY_DIR"/*.include "$STUDY_DIR"/*.mfront; do
@@ -995,103 +849,53 @@ for f in "$STUDY_DIR"/*.py "$STUDY_DIR"/*.dat "$STUDY_DIR"/*.para \
 done
 shopt -u nullglob
 
-# ─────────────────────────────────────────────────────────────────
-# Conversion de la memoire en MB
-#
-# Code_Aster attend memory_limit en MB dans le .export.
-# On convertit la valeur fournie par l'utilisateur (ex: "8G") en MB.
-# On reserve 512 MB pour le systeme (OS, bibliotheques).
-# Le minimum garanti a Aster est 512 MB.
-#
-# Logique awk :
-#   - tolower : normalise en minuscules pour le matching
-#   - gsub : supprime les lettres de l'unite (G, g, M, m, i)
-#   - int  : convertit en entier
-# ─────────────────────────────────────────────────────────────────
+# ── Conversion memoire / duree ────────────────────────────────
 MEM_MB=$(echo "$MEM" | awk '
     tolower($0) ~ /g$/ { gsub(/[gGiI]/,""); print int($0*1024); next }
     tolower($0) ~ /m$/ { gsub(/[mMiI]/,""); print int($0);      next }
     /^[0-9]+$/          { print int($0); next }
     { print -1 }')
 [ "$MEM_MB" -le 0 ] 2>/dev/null && { err "Memoire invalide : $MEM"; exit 1; }
-ASTER_MEM=$(( MEM_MB - 512 ))      # Soustrait 512 MB pour le systeme
-[ "$ASTER_MEM" -lt 512 ] && ASTER_MEM=512   # Plancher de securite
+ASTER_MEM=$(( MEM_MB - 512 ))
+[ "$ASTER_MEM" -lt 512 ] && ASTER_MEM=512
 
-# ─────────────────────────────────────────────────────────────────
-# Conversion de la duree en secondes
-#
-# Code_Aster attend time_limit en secondes dans le .export.
-# awk utilise -F'[-:]' comme separateur de champs, ce qui decoupe
-# a la fois sur '-' et ':', gerant nativement le format avec jours :
-#
-#   "2-00:00:00"  -> $1=2  $2=00 $3=00 $4=00  NF=4 -> 2*86400 = 172800 s
-#   "05:00:00"    -> $1=05 $2=00 $3=00         NF=3 -> 5*3600  = 18000 s
-#   "30:00"       -> $1=30 $2=00               NF=2 -> 30*60   = 1800 s
-#   "60"          -> $1=60                     NF=1 -> 60*60   = 3600 s
-# ─────────────────────────────────────────────────────────────────
 TIME_SEC=$(echo "$TIME_LIMIT" | awk -F'[-:]' '
-    NF==4 {print $1*86400+$2*3600+$3*60+$4; next}  # J-HH:MM:SS
-    NF==3 {print $1*3600+$2*60+$3;          next}  # HH:MM:SS
-    NF==2 {print $1*60+$2;                  next}  # MM:SS
-    {print $1*60}')                                 # MM
+    NF==4 {print $1*86400+$2*3600+$3*60+$4; next}
+    NF==3 {print $1*3600+$2*60+$3;          next}
+    NF==2 {print $1*60+$2;                  next}
+    {print $1*60}')
 
-# ─────────────────────────────────────────────────────────────────
-# Generation du fichier .export
-#
-# Le .export est le fichier de configuration de Code_Aster.
-# Format de chaque ligne :
-#   P param valeur          -> parametre global du calcul
-#   F type chemin D|R unite -> fichier (F) ou repertoire (R)
-#                              D = entree (Donnee), R = sortie (Resultat)
-#                              unite = numero d'unite logique Fortran
-#
-# Le bloc { ... } > "$EXPORT" redirige toute la sortie standard du groupe
-# de commandes vers le fichier .export en une seule operation.
-# ─────────────────────────────────────────────────────────────────
+# ── Generation du .export ─────────────────────────────────────
 $QUIET || section "Generation du .export"
 EXPORT="${SCRATCH}/${STUDY_NAME}.export"
 {
-    # Parametres globaux du calcul
-    echo "P time_limit $TIME_SEC"       # Duree max en secondes (arret force par Aster)
-    echo "P memory_limit $ASTER_MEM"   # Memoire max en MB
-    echo "P ncpus $NTASKS"             # Nombre de CPUs/taches MPI
+    echo "P time_limit $TIME_SEC"
+    echo "P memory_limit $ASTER_MEM"
+    echo "P ncpus $NTASKS"
 
-    # Fichiers d'entree principaux
-    echo "F comm ${SCRATCH}/$(basename "$COMM") D 1"    # Unite 1 : fichier de commandes
-    [ -n "$MED" ]  && echo "F mmed ${SCRATCH}/$(basename "$MED") D 20"    # Unite 20 : maillage MED
-    [ -n "$MAIL" ] && echo "F mail ${SCRATCH}/$(basename "$MAIL") D 20"   # Unite 20 : maillage ASTER
+    echo "F comm ${SCRATCH}/$(basename "$COMM") D 1"
+    [ -n "$MED" ]  && echo "F mmed ${SCRATCH}/$(basename "$MED") D 20"
+    [ -n "$MAIL" ] && echo "F mail ${SCRATCH}/$(basename "$MAIL") D 20"
 
-    # Fichiers de sortie standard
-    echo "F mess ${SCRATCH}/${STUDY_NAME}.mess R 6"              # Unite 6 : messages (log Aster)
-    echo "F resu ${SCRATCH}/${STUDY_NAME}.resu R 8"              # Unite 8 : resultats texte
-    echo "F rmed ${SCRATCH}/${STUDY_NAME}_resu.rmed R 80"        # Unite 80 : resultats MED (ParaVis)
+    echo "F mess ${SCRATCH}/${STUDY_NAME}.mess R 6"
+    echo "F resu ${SCRATCH}/${STUDY_NAME}.resu R 8"
+    echo "F rmed ${SCRATCH}/${STUDY_NAME}_resu.rmed R 80"
 
-    # Sorties supplementaires definies par l'utilisateur via -R.
-    # Format attendu : "type:unite,type:unite,..." (ex: "rmed:81,csv:38")
-    # Les espaces sont nettoyes pour accepter "rmed:81, csv:38".
-    # ${item%%:*} extrait la partie avant ':' (type)
-    # ${item##*:} extrait la partie apres ':' (unite)
     if [ -n "$RESULTS" ]; then
-        RESULTS_CLEAN="${RESULTS// /}"   # Supprime tous les espaces
-        IFS=',' read -ra ITEMS <<< "$RESULTS_CLEAN"
+        IFS=',' read -ra ITEMS <<< "${RESULTS// /}"
         for item in "${ITEMS[@]}"; do
             TYPE="${item%%:*}"; UNIT="${item##*:}"
             echo "F ${TYPE} ${SCRATCH}/${STUDY_NAME}_u${UNIT}.${TYPE} R ${UNIT}"
         done
     fi
-
-
 } > "$EXPORT"
 
-# Affiche le contenu du .export genere (sauf en mode quiet)
 if ! $QUIET; then
     ok "Export : $EXPORT"
     while IFS= read -r line; do info "  $line"; done < "$EXPORT"
 fi
 
-# ─────────────────────────────────────────────────────────────────
-# Recapitulatif des ressources demandees
-# ─────────────────────────────────────────────────────────────────
+# ── Recapitulatif ─────────────────────────────────────────────
 if ! $QUIET; then
     section "Ressources Slurm"
     info "Partition : $PARTITION | Noeuds : $NODES | Taches : $NTASKS | CPUs : $CPUS"
@@ -1099,71 +903,42 @@ if ! $QUIET; then
     [ "$KEEP_SCRATCH" = "1" ] && info "Scratch   : conserve"
 fi
 
-# ─────────────────────────────────────────────────────────────────
-# _follow_job : suit un job Slurm apres soumission
-#
-#   1. Affiche l'etat (PENDING/CONFIGURING/...) avec un spinner jusqu'au
-#      passage en RUNNING.
-#   2. Des que RUNNING, enchaine automatiquement sur tail -f du log.
-#   3. A la fin du job, affiche un bilan (alarmes / erreurs fatales).
-#   Ctrl+C pendant le tail detache proprement sans annuler le calcul.
-# ─────────────────────────────────────────────────────────────────
+# ── Suivi du job ──────────────────────────────────────────────
 _follow_job() {
     local job="$1" logfile="$2"
     local state="" spinner_idx=0
     local -a SP=('|' '/' '-' '\')
 
-    # ── Attente du passage en RUNNING ────────────────────────────
     echo ""
     while true; do
         state=$(squeue -j "$job" -h -o "%T" 2>/dev/null || true)
-        if [ -z "$state" ]; then
-            # Job deja termine (tres court ou erreur immediate)
-            break
-        fi
+        [ -z "$state" ] && break
         if [ "$state" = "RUNNING" ]; then
-            printf "\r  %-70s\n" "Etat : RUNNING"
-            break
+            printf "\r  %-70s\n" "Etat : RUNNING"; break
         fi
-        printf "\r  %s  %-12s  %s" \
-            "${SP[$spinner_idx]}" "$state" "(Ctrl+C pour detacher)"
+        printf "\r  %s  %-12s  %s" "${SP[$spinner_idx]}" "$state" "(Ctrl+C pour detacher)"
         spinner_idx=$(( (spinner_idx+1) % 4 ))
         sleep 3
     done
 
-    # ── Tail live si le job est en cours ─────────────────────────
     if [ "$state" = "RUNNING" ]; then
-        info "Logs en temps reel — Ctrl+C pour detacher sans annuler :"
+        info "Logs en temps reel — Ctrl+C pour detacher :"
         echo ""
-        # Attendre l'apparition du fichier log (max 30 s)
         local t=0
-        while ! [ -f "$logfile" ] && [ "$t" -lt 30 ]; do
-            sleep 1; t=$((t + 1))
-        done
+        while ! [ -f "$logfile" ] && [ "$t" -lt 30 ]; do sleep 1; t=$((t + 1)); done
         [ -f "$logfile" ] || warn "Fichier log introuvable : $logfile"
 
         tail -f "$logfile" &
         local TAIL_PID=$!
-
-        # Ctrl+C : detacher sans tuer le job
         # shellcheck disable=SC2064
-        trap "kill $TAIL_PID 2>/dev/null; echo ''; \
-              info 'Detache — job $job toujours en cours'; \
-              info 'Relancer avec : tail -f $logfile'; exit 0" INT
-
-        # Polling jusqu'a la fin du job (toutes les 5 s)
+        trap "kill $TAIL_PID 2>/dev/null; echo ''; info 'Detache — job $job toujours en cours'; exit 0" INT
         while squeue -j "$job" -h &>/dev/null; do sleep 5; done
-
-        sleep 2   # laisser tail vider le buffer restant
-        kill $TAIL_PID 2>/dev/null
-        wait $TAIL_PID 2>/dev/null
-        trap - INT
+        sleep 2; kill $TAIL_PID 2>/dev/null; wait $TAIL_PID 2>/dev/null; trap - INT
     fi
 
-    # ── Bilan final ───────────────────────────────────────────────
+    # Bilan
     local dest="${STUDY_DIR}/run_${job}"
-    echo ""
-    section "BILAN JOB $job"
+    echo ""; section "BILAN JOB $job"
     if [ -d "$dest" ]; then
         local mess na nf ns
         mess=$(ls "${dest}"/*.mess 2>/dev/null | head -1 || true)
@@ -1185,77 +960,49 @@ _follow_job() {
     fi
 }
 
-# ─────────────────────────────────────────────────────────────────
-# Soumission via sbatch
-#
-# sbatch est la commande de soumission de Slurm.
-# --parsable : affiche uniquement le JOB ID sur stdout (pas de message)
-# --export   : liste des variables d'environnement transmises au job.
-#              "ALL" transmet tout l'environnement courant, puis on
-#              ajoute les variables __* propres au script.
-#              Ces variables permettent a la Phase 2 de retrouver tous
-#              les chemins et options sans avoir a les re-parser.
-#
-# SELF = chemin absolu de ce script (obtenu via realpath $0).
-# On soumet CE MEME fichier, qui en Phase 2 entrera dans le bloc
-# if [ "${__RUN_PHASE:-}" = "EXEC" ] grace a la variable transmise.
-# ─────────────────────────────────────────────────────────────────
+# ── Soumission sbatch ─────────────────────────────────────────
 $QUIET || section "Soumission Slurm"
 
 SELF="$(realpath "$0")"
+VARS="ALL,__RUN_PHASE=EXEC,__STUDY_DIR=${STUDY_DIR},__STUDY_NAME=${STUDY_NAME}"
+VARS+=",__SCRATCH=${SCRATCH},__EXPORT=${EXPORT},__ASTER_ROOT=${ASTER_ROOT}"
+VARS+=",__MODULE=${ASTER_MODULE},__KEEP_SCRATCH=${KEEP_SCRATCH},__DEBUG=${DEBUG}"
 
-# Construction de la chaine de variables a exporter
-VARS="ALL"
-VARS+=",__RUN_PHASE=EXEC"             # Signal pour activer la Phase 2
-VARS+=",__STUDY_DIR=${STUDY_DIR}"     # Chemin absolu du dossier d'etude
-VARS+=",__STUDY_NAME=${STUDY_NAME}"   # Nom de l'etude (base des noms de fichiers)
-VARS+=",__SCRATCH=${SCRATCH}"         # Chemin absolu du scratch
-VARS+=",__EXPORT=${EXPORT}"           # Chemin absolu du .export genere
-VARS+=",__ASTER_ROOT=${ASTER_ROOT}"   # Racine Code_Aster pour trouver l'executable
-VARS+=",__MODULE=${ASTER_MODULE}"     # Nom du module a charger (peut etre vide)
-VARS+=",__KEEP_SCRATCH=${KEEP_SCRATCH}"  # 1 = ne pas supprimer le scratch
-VARS+=",__DEBUG=${DEBUG}"             # 1 = activer set -x en Phase 2
-# Construction de la commande sbatch sous forme de tableau bash.
-# Un tableau evite les problemes de quoting avec les espaces dans les chemins.
 CMD=(sbatch --parsable
-    --job-name="aster_${STUDY_NAME}"        # Nom visible dans squeue
+    --job-name="aster_${STUDY_NAME}"
     --partition="$PARTITION"
     --nodes="$NODES"
     --ntasks="$NTASKS"
     --cpus-per-task="$CPUS"
     --mem="$MEM"
     --time="$TIME_LIMIT"
-    --output="${STUDY_DIR}/aster_run_%j.out"    # %j = JOB ID, remplace automatiquement
+    --output="${STUDY_DIR}/aster_run_%j.out"
     --error="${STUDY_DIR}/aster_run_%j.err"
     --export="$VARS"
-    "$SELF"   # Ce meme script, execute en Phase 2 sur le noeud de calcul
+    "$SELF"
 )
 
-# Mode dry-run : affiche la commande sans la soumettre (utile pour verifier)
 if [ "$DRY_RUN" = "1" ]; then
     section "DRY RUN — commande sbatch (non lancee)"
     echo "  ${CMD[*]}"
+    echo ""
+    info "Contenu du .export genere :"
+    while IFS= read -r line; do info "  $line"; done < "$EXPORT"
     exit 0
 fi
 
-# Soumission reelle : capture le JOB ID retourne par sbatch --parsable
 JOB=$("${CMD[@]}") || { err "sbatch a echoue"; exit 1; }
 [ -z "$JOB" ] && { err "Job ID vide"; exit 1; }
 
-# Affichage final : mode quiet -> juste le JOB ID (pour scripts)
-#                  mode normal -> commandes utiles pour suivre le job
 if $QUIET; then
     echo "$JOB"
 else
     ok "Job $JOB soumis"
     echo ""
-    echo "  squeue -j $JOB"
+    echo "  squeue -j $JOB              # Etat du job"
     echo "  tail -f ${STUDY_DIR}/aster_run_${JOB}.out"
-    echo "  scancel $JOB"
-    echo "  ls ${STUDY_DIR}/run_${JOB}/"
-    echo "  squeue -j $JOB -h -o '%T'  # Etat du job (PENDING/RUNNING/...)"
-    echo "  sacct -j $JOB --format=JobID,State,ExitCode  # Bilan apres fin du job"
-    echo "  sview ${STUDY_DIR}/aster_run_${JOB}.out  #interface graphique de suivi en temps reel (si disponible)"
+    echo "  scancel $JOB                # Annuler"
+    echo "  ls ${STUDY_DIR}/run_${JOB}/ # Resultats"
     echo ""
     [ "$FOLLOW" = "1" ] && _follow_job "$JOB" "${STUDY_DIR}/aster_run_${JOB}.out"
 fi
