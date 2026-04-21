@@ -20,7 +20,7 @@
 #  NOTE MPI : run_aster gere MPI en interne — ne PAS encapsuler dans srun.
 #
 #  Auteur  : Teo LEROY
-#  Version : 13.0
+#  Version : 14.0
 #===============================================================================
 
 # ══════════════════════════════════════════
@@ -221,6 +221,96 @@ _count_files() {
     local -a arr=()
     shopt -s nullglob; arr=("${dir}"/${pattern}); shopt -u nullglob
     echo "${#arr[@]}"
+}
+
+# ══════════════════════════════════════════
+#  VALIDATION TYPE / UNITE dans le .export
+# ══════════════════════════════════════════
+#
+#  Conventions Code_Aster :
+#    TYPE    UNITE attendue    Sens typique
+#    ------  ---------------  ─────────────────────────────
+#    comm    1                 Fichier de commandes (D)
+#    mmed    20                Maillage MED         (D)
+#    mail    20                Maillage ASCII       (D)
+#    mess    6                 Fichier message      (R)
+#    resu    8                 Résultats texte      (R)
+#    rmed    80–99             Résultats MED        (R)
+#    libr    —                 Bibliothèque Fortran
+#
+#  Réciproquement, chaque UNITE standard est réservée :
+#    1  → comm   6  → mess   8  → resu
+#    20 → mmed/mail   80+ → rmed
+#
+# _validate_export_line TYPE UNITE
+#   Affiche un avertissement si le couple est inhabituel,
+#   et retourne 1 (erreur fatale) si la combinaison est clairement
+#   incohérente (ex. rmed avec UNITE 8, ou resu avec UNITE 80).
+# ──────────────────────────────────────────────────────────────────
+_validate_export_line() {
+    local type="$1"
+    local unite="$2"
+    local ok_flag=0  # 1 = erreur fatale détectée
+
+    # Table : UNITE attendue pour chaque TYPE standard
+    case "$type" in
+        comm)
+            if [ "$unite" -ne 1 ]; then
+                warn "TYPE 'comm' utilise normalement UNITE=1 (UNITE fournie : $unite)"
+            fi ;;
+        mmed|mail)
+            if [ "$unite" -ne 20 ]; then
+                warn "TYPE '$type' utilise normalement UNITE=20 (UNITE fournie : $unite)"
+            fi ;;
+        mess)
+            if [ "$unite" -ne 6 ]; then
+                err "TYPE 'mess' DOIT utiliser UNITE=6 — UNITE=$unite est invalide"
+                ok_flag=1
+            fi ;;
+        resu)
+            if [ "$unite" -ne 8 ]; then
+                if [ "$unite" -ge 80 ] && [ "$unite" -le 99 ]; then
+                    err "TYPE 'resu' (texte) avec UNITE=$unite ressemble à une confusion avec 'rmed' (MED binaire, UNITE 80+)"
+                    ok_flag=1
+                else
+                    warn "TYPE 'resu' utilise normalement UNITE=8 (UNITE fournie : $unite)"
+                fi
+            fi ;;
+        rmed)
+            if [ "$unite" -lt 80 ]; then
+                err "TYPE 'rmed' nécessite UNITE>=80 — UNITE=$unite est invalide (risque d'écrasement de mess/resu)"
+                ok_flag=1
+            fi ;;
+        libr)
+            # pas de convention stricte sur UNITE
+            : ;;
+        *)
+            # TYPE non standard (ex. table, csv, dat…) : vérifier qu'il
+            # n'empiète pas sur des UNITE réservées
+            case "$unite" in
+                1)  warn "UNITE=1 est réservée à 'comm'  — TYPE '$type' risque un conflit" ;;
+                6)  warn "UNITE=6 est réservée à 'mess'  — TYPE '$type' risque un conflit" ;;
+                8)  warn "UNITE=8 est réservée à 'resu'  — TYPE '$type' risque un conflit" ;;
+                20) warn "UNITE=20 est réservée à 'mmed/mail' — TYPE '$type' risque un conflit" ;;
+            esac ;;
+    esac
+
+    # Table réciproque : TYPE attendu pour chaque UNITE réservée
+    case "$unite" in
+        1)  [ "$type" != "comm" ] && {
+                err "UNITE=1 est réservée à 'comm', pas à '$type'"
+                ok_flag=1; } ;;
+        6)  [ "$type" != "mess" ] && {
+                err "UNITE=6 est réservée à 'mess', pas à '$type'"
+                ok_flag=1; } ;;
+        8)  [ "$type" != "resu" ] && {
+                err "UNITE=8 est réservée à 'resu', pas à '$type' (pour MED, utiliser rmed + UNITE>=80)"
+                ok_flag=1; } ;;
+        20) [[ "$type" != "mmed" && "$type" != "mail" ]] && {
+                warn "UNITE=20 est normalement reservee au maillage (mmed/mail), pas a '$type'"; } ;;
+    esac
+
+    return "$ok_flag"
 }
 
 # ══════════════════════════════════════════
@@ -837,27 +927,60 @@ TIME_SEC=$(echo "$TIME_LIMIT" | awk -F'[-:]' '
 # ── Generation du .export ─────────────────────────────────────
 section "Génération du .export"
 EXPORT="${SCRATCH}/${STUDY_NAME}.export"
+
+# Compteur d'erreurs TYPE/UNITE — bloquant si > 0
+_export_errors=0
+
+# Fonction interne : écrit la ligne ET valide TYPE/UNITE
+_write_export_line() {
+    local keyword="$1"   # F ou P
+    local type="$2"
+    local path="$3"
+    local dir="$4"       # D ou R
+    local unite="$5"
+
+    echo "${keyword} ${type} ${path} ${dir} ${unite}" >> "$EXPORT"
+
+    # Valider seulement les lignes F (fichiers), pas P (paramètres)
+    if [ "$keyword" = "F" ]; then
+        if ! _validate_export_line "$type" "$unite" >/dev/tty 2>&1; then
+            _export_errors=$(( _export_errors + 1 ))
+        fi
+    fi
+}
+
 {
     echo "P time_limit $TIME_SEC"
     echo "P memory_limit $ASTER_MEM"
     echo "P ncpus $NTASKS"
+} >> "$EXPORT"
 
-    echo "F comm ${SCRATCH}/$(basename "$COMM") D 1"
-    [ -n "$MED" ]  && echo "F mmed ${SCRATCH}/$(basename "$MED") D 20"
-    [ -n "$MAIL" ] && echo "F mail ${SCRATCH}/$(basename "$MAIL") D 20"
+# Lignes fixes — chacune est validée
+_write_export_line F comm  "${SCRATCH}/$(basename "$COMM")"              D 1
+[ -n "$MED" ]  && _write_export_line F mmed "${SCRATCH}/$(basename "$MED")"  D 20
+[ -n "$MAIL" ] && _write_export_line F mail "${SCRATCH}/$(basename "$MAIL")" D 20
 
-    echo "F mess ${SCRATCH}/${STUDY_NAME}.mess R 6"
-    echo "F resu ${SCRATCH}/${STUDY_NAME}.resu R 8"
-    echo "F rmed ${SCRATCH}/${STUDY_NAME}_resu.rmed R 80"
+_write_export_line F mess "${SCRATCH}/${STUDY_NAME}.mess" R 6
+_write_export_line F resu "${SCRATCH}/${STUDY_NAME}.resu" R 8
+_write_export_line F rmed "${SCRATCH}/${STUDY_NAME}_resu.rmed" R 80
 
-    if [ -n "$RESULTS" ]; then
-        IFS=',' read -ra ITEMS <<< "${RESULTS// /}"
-        for item in "${ITEMS[@]}"; do
-            TYPE="${item%%:*}"; UNIT="${item##*:}"
-            echo "F ${TYPE} ${SCRATCH}/${STUDY_NAME}_u${UNIT}.${TYPE} R ${UNIT}"
-        done
-    fi
-} > "$EXPORT"
+# Lignes RESULTS (sorties supplémentaires détectées dans le .comm)
+if [ -n "$RESULTS" ]; then
+    IFS=',' read -ra ITEMS <<< "${RESULTS// /}"
+    for item in "${ITEMS[@]}"; do
+        TYPE="${item%%:*}"
+        UNIT="${item##*:}"
+        _write_export_line F "$TYPE" "${SCRATCH}/${STUDY_NAME}_u${UNIT}.${TYPE}" R "$UNIT"
+    done
+fi
+
+# Bloquer la soumission si des erreurs TYPE/UNITE ont été détectées
+if [ "$_export_errors" -gt 0 ]; then
+    err "$_export_errors erreur(s) TYPE/UNITE dans le .export — soumission annulée"
+    err "Corrigez les couples TYPE:UNITE dans la déclaration RESULTS ou dans le .comm"
+    rm -rf "$SCRATCH"
+    exit 1
+fi
 
 ok "Export : $EXPORT" >/dev/tty
 while IFS= read -r line; do info "  $line" >/dev/tty; done < "$EXPORT"
