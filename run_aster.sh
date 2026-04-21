@@ -339,6 +339,99 @@ _flatten_comm() {
     ' "$1" 2>/dev/null
 }
 
+# _unite_to_canonical_type UNITE INSTRUCTION [EXT]
+#
+#   Déduit le TYPE canonique du .export à partir de l'UNITE et
+#   du contexte de l'instruction Aster, en appliquant exactement
+#   les mêmes règles que _validate_export_line.
+#
+#   Priorité :
+#     1. UNITE réservée  → TYPE imposé  (1→comm  6→mess  8→resu  20→mmed/mail)
+#     2. UNITE ≥ 80      → rmed  (sauf si l'instruction contredit cela)
+#     3. Instruction Aster → TYPE déduit du contexte
+#     4. Extension de fichier DEFI_FICHIER → TYPE = extension
+#     5. Fallback → "dat"
+#
+#   Retourne également un signal d'incohérence si l'instruction et
+#   l'UNITE se contredisent (ex. IMPR_RESU sans MED sur UNITE≥80).
+#
+_unite_to_canonical_type() {
+    local unite="$1"
+    local instr="$2"      # IMPR_RESU / IMPR_TABLE / DEFI_FICHIER / …
+    local fmt="$3"        # FORMAT=MED détecté ? ("MED" ou "")
+    local ext="$4"        # extension DEFI_FICHIER si présente
+
+    local type=""
+    local warn_msg=""
+
+    # ── 1. UNITE strictement réservées ───────────────────────────
+    case "$unite" in
+        1)  type="comm" ;;
+        6)  type="mess" ;;
+        8)  type="resu" ;;
+        20) # entrée maillage — ne devrait pas apparaître en sortie
+            type="mmed"
+            warn_msg="UNITE=20 est réservée au maillage (D) — une sortie sur cette UNITE est inhabituelle" ;;
+    esac
+
+    # ── 2. UNITE ≥ 80 → rmed par convention ─────────────────────
+    if [ -z "$type" ] && [ "$unite" -ge 80 ]; then
+        type="rmed"
+        # Vérification de cohérence : si l'instruction est IMPR_RESU
+        # sans FORMAT=MED, c'est suspect
+        if [ "$instr" = "IMPR_RESU" ] && [ "$fmt" != "MED" ]; then
+            warn_msg="IMPR_RESU sans FORMAT=MED sur UNITE=$unite (≥80 → rmed attendu) — FORMAT=MED manquant ?"
+        fi
+    fi
+
+    # ── 3. Déduction depuis l'instruction Aster ──────────────────
+    if [ -z "$type" ]; then
+        case "$instr" in
+            IMPR_RESU)
+                if [ "$fmt" = "MED" ]; then
+                    type="rmed"
+                    # Cohérence : rmed devrait être sur UNITE≥80
+                    if [ "$unite" -lt 80 ]; then
+                        warn_msg="IMPR_RESU FORMAT=MED (→ rmed) sur UNITE=$unite — UNITE devrait être ≥80"
+                    fi
+                else
+                    type="resu"
+                    # Cohérence : resu devrait être sur UNITE=8
+                    if [ "$unite" -ne 8 ]; then
+                        warn_msg="IMPR_RESU texte (→ resu) sur UNITE=$unite — UNITE devrait être 8"
+                    fi
+                fi ;;
+            IMPR_TABLE)
+                type="table" ;;
+            DEFI_FICHIER)
+                # ── 4. Extension explicite dans FICHIER='…' ──────
+                if [ -n "$ext" ]; then
+                    type="$ext"
+                else
+                    type="dat"
+                fi ;;
+            *)
+                # ── 5. Fallback ──────────────────────────────────
+                type="dat" ;;
+        esac
+    fi
+
+    # Sortie : TYPE sur stdout, message d'alerte sur stderr
+    echo "$type"
+    [ -n "$warn_msg" ] && echo "$warn_msg" >&2
+}
+
+# _parse_comm_outputs COMM_FILE
+#
+#   Analyse le .comm aplati, détecte toutes les sorties non standard
+#   (UNITE ≠ 1/6/8/20 côté entrée-only), détermine le TYPE canonique
+#   via _unite_to_canonical_type, et alerte si TYPE déduit et TYPE
+#   inféré depuis l'instruction sont incohérents.
+#
+#   Remplit le tableau global _COMM_OUTPUTS avec des entrées :
+#     "LABEL|TYPE|UNITE"
+#   où TYPE est le type canonique utilisable dans le .export.
+#
 _parse_comm_outputs() {
     local comm_file="$1"
     _COMM_OUTPUTS=()
@@ -347,27 +440,63 @@ _parse_comm_outputs() {
 
     while IFS= read -r block; do
         [ -z "$block" ] && continue
+
+        # Extraire l'UNITE du bloc
         local unite
         unite=$(echo "$block" | sed -n 's/.*UNITE[[:space:]]*=[[:space:]]*\([0-9]\+\).*/\1/p' | head -1)
         [ -z "$unite" ] && continue
-        case "$unite" in 1|6|8|20|80) continue ;; esac
 
-        local type label
-        if echo "$block" | grep -q "IMPR_RESU"; then
-            if echo "$block" | grep -qE "FORMAT[[:space:]]*=[[:space:]]*['\"]MED['\"]"; then
-                type="rmed"; label="IMPR_RESU FORMAT=MED    →  unite $unite  (.rmed)"
-            else
-                type="resu"; label="IMPR_RESU              →  unite $unite  (.resu)"
-            fi
-        elif echo "$block" | grep -q "IMPR_TABLE"; then
-            type="table"; label="IMPR_TABLE             →  unite $unite  (.table)"
-        elif echo "$block" | grep -q "DEFI_FICHIER"; then
-            local ext
-            ext=$(echo "$block" | sed -n "s/.*FICHIER[[:space:]]*=[[:space:]]*['\"][^'\"]*\.\([a-zA-Z0-9]*\)['\"].*/\1/p" | head -1)
-            type="${ext:-dat}"; label="DEFI_FICHIER           →  unite $unite${ext:+  (.$ext)}"
-        else
-            continue
+        # Ignorer les UNITE d'entrée pure (comm=1, maillage=20)
+        # mais garder mess=6, resu=8, rmed=80 car ils peuvent
+        # apparaître en sorties supplémentaires dans le .comm
+        case "$unite" in
+            1|20) continue ;;
+        esac
+
+        # Identifier l'instruction Aster dans le bloc
+        local instr=""
+        for _kw in IMPR_RESU IMPR_TABLE DEFI_FICHIER; do
+            echo "$block" | grep -q "$_kw" && { instr="$_kw"; break; }
+        done
+        [ -z "$instr" ] && continue
+
+        # Extraire FORMAT=MED si présent
+        local fmt=""
+        echo "$block" | grep -qE "FORMAT[[:space:]]*=[[:space:]]*['\"]?MED['\"]?" && fmt="MED"
+
+        # Extraire l'extension dans FICHIER='chemin.ext'
+        local ext=""
+        if [ "$instr" = "DEFI_FICHIER" ]; then
+            ext=$(echo "$block" | \
+                  sed -n "s/.*FICHIER[[:space:]]*=[[:space:]]*['\"][^'\"]*\.\([a-zA-Z0-9]*\)['\"].*/\1/p" \
+                  | head -1)
         fi
+
+        # Déduire le TYPE canonique (les warnings incohérents vont sur stderr → /dev/tty)
+        local type warn_out
+        warn_out=$( _unite_to_canonical_type "$unite" "$instr" "$fmt" "$ext" 2>&1 >/dev/null )
+        type=$(      _unite_to_canonical_type "$unite" "$instr" "$fmt" "$ext" 2>/dev/null )
+
+        # Afficher l'éventuel avertissement de cohérence dès l'analyse
+        if [ -n "$warn_out" ]; then
+            warn "$warn_out" >/dev/tty
+        fi
+
+        # Construire le label affiché dans le menu
+        local label
+        case "$instr" in
+            IMPR_RESU)
+                if [ "$fmt" = "MED" ]; then
+                    label="IMPR_RESU FORMAT=MED  →  unite $unite  (type: $type)"
+                else
+                    label="IMPR_RESU texte       →  unite $unite  (type: $type)"
+                fi ;;
+            IMPR_TABLE)
+                label="IMPR_TABLE            →  unite $unite  (type: $type)" ;;
+            DEFI_FICHIER)
+                label="DEFI_FICHIER          →  unite $unite  (type: $type${ext:+  ext: .$ext})" ;;
+        esac
+
         _COMM_OUTPUTS+=("${label}|${type}|${unite}")
     done <<< "$flat"
 }
@@ -408,17 +537,18 @@ _validate_comm() {
         fi
     fi
 
+    # ── Vérification UNITE déclarées vs .export ──────────────────
+    # On réutilise _COMM_OUTPUTS (déjà rempli par _parse_comm_outputs
+    # juste avant l'appel à _validate_comm) — pas de re-parcours du .comm.
     local -a all_unites=()
-    while IFS= read -r block; do
-        [ -z "$block" ] && continue
-        local u
-        u=$(echo "$block" | sed -n 's/.*UNITE[[:space:]]*=[[:space:]]*\([0-9]\+\).*/\1/p' | head -1)
-        [ -z "$u" ] && continue
-        case "$u" in 1|6|8|20|80) continue ;; esac
-        if echo "$block" | grep -qE "IMPR_RESU|IMPR_TABLE|DEFI_FICHIER"; then
-            all_unites+=("$u")
-        fi
-    done <<< "$flat"
+    local -a all_types=()
+    for _entry in "${_COMM_OUTPUTS[@]}"; do
+        local _t _u
+        _t="${_entry#*|}"; _t="${_t%%|*}"   # TYPE
+        _u="${_entry##*|}"                   # UNITE
+        all_types+=("$_t")
+        all_unites+=("$_u")
+    done
 
     local declared_unites=""
     if [ -n "$results" ]; then
@@ -434,8 +564,11 @@ _validate_comm() {
 
     if [ ${#missing_unites[@]} -gt 0 ]; then
         warn "UNITE de sortie dans le .comm non declarees dans le .export :"
-        for u in "${missing_unites[@]}"; do
-            warn "  → UNITE=$u  (pas de ligne F ... R $u dans le .export)"
+        for i in "${!all_unites[@]}"; do
+            local _mu="${all_unites[$i]}"
+            if ! echo "$declared_unites" | grep -qw "$_mu"; then
+                warn "  → UNITE=$_mu  type attendu: ${all_types[$i]}  (pas de ligne F ${all_types[$i]} ... R $_mu)"
+            fi
         done
         warn "Ces fichiers de sortie seront perdus apres le calcul !"
     elif [ ${#all_unites[@]} -gt 0 ]; then
